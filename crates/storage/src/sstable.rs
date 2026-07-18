@@ -96,7 +96,11 @@ impl SsTableReader {
         let bloom_offset = u64::from_le_bytes(foot[8..16].try_into().unwrap());
 
         let footer_start = len - 32;
-        let bloom_len = (footer_start - bloom_offset) as usize;
+        if index_offset > bloom_offset || bloom_offset > footer_start {
+            return Err(Error::Corruption("invalid sstable offsets".into()));
+        }
+        let bloom_len = usize::try_from(footer_start - bloom_offset)
+            .map_err(|_| Error::Corruption("sstable bloom is too large".into()))?;
         file.seek(SeekFrom::Start(bloom_offset))?;
         let mut bloom_bytes = vec![0u8; bloom_len];
         file.read_exact(&mut bloom_bytes)?;
@@ -107,27 +111,49 @@ impl SsTableReader {
         let mut entries = Vec::new();
         let mut pos = 0u64;
         while pos < index_offset {
+            if index_offset - pos < 4 {
+                return Err(Error::Corruption("truncated sstable key length".into()));
+            }
             let mut klen_b = [0u8; 4];
             r.read_exact(&mut klen_b)?;
-            let klen = u32::from_le_bytes(klen_b) as usize;
+            pos += 4;
+            let klen = u64::from(u32::from_le_bytes(klen_b));
+            if klen.saturating_add(9) > index_offset - pos {
+                return Err(Error::Corruption(
+                    "sstable key length exceeds data section".into(),
+                ));
+            }
+            let klen = klen as usize;
             let mut key = vec![0u8; klen];
             r.read_exact(&mut key)?;
+            pos += klen as u64;
             let mut seqno_b = [0u8; 8];
             r.read_exact(&mut seqno_b)?;
             let seqno = u64::from_le_bytes(seqno_b);
             let mut hv = [0u8; 1];
             r.read_exact(&mut hv)?;
-            let (value, consumed_val) = if hv[0] == 1 {
+            pos += 9;
+            let value = if hv[0] == 1 {
+                if index_offset - pos < 4 {
+                    return Err(Error::Corruption("truncated sstable value length".into()));
+                }
                 let mut vlen_b = [0u8; 4];
                 r.read_exact(&mut vlen_b)?;
-                let vlen = u32::from_le_bytes(vlen_b) as usize;
+                pos += 4;
+                let vlen = u64::from(u32::from_le_bytes(vlen_b));
+                if vlen > index_offset - pos {
+                    return Err(Error::Corruption(
+                        "sstable value length exceeds data section".into(),
+                    ));
+                }
+                let vlen = vlen as usize;
                 let mut v = vec![0u8; vlen];
                 r.read_exact(&mut v)?;
-                (Some(v), 4 + vlen)
+                pos += vlen as u64;
+                Some(v)
             } else {
-                (None, 0)
+                None
             };
-            pos += (4 + klen + 8 + 1 + consumed_val) as u64;
             entries.push((
                 InternalKey {
                     user_key: key,
@@ -159,6 +185,8 @@ impl SsTableReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom};
     use tempfile::tempdir;
 
     fn ik(k: &[u8], s: Seqno) -> InternalKey {
@@ -166,6 +194,12 @@ mod tests {
             user_key: k.to_vec(),
             seqno: s,
         }
+    }
+
+    fn overwrite_u32(path: &Path, offset: u64, value: u32) {
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&value.to_le_bytes()).unwrap();
     }
 
     #[test]
@@ -222,5 +256,37 @@ mod tests {
             .map(|(k, _)| (k.user_key, k.seqno))
             .collect();
         assert_eq!(got, vec![(b"a".to_vec(), 1), (b"b".to_vec(), 1)]);
+    }
+
+    #[test]
+    fn oversized_key_length_returns_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("oversized-key.sst");
+        let mut w = SsTableWriter::create(&path).unwrap();
+        w.add(&ik(b"k", 1), &Some(b"v".to_vec())).unwrap();
+        w.finish().unwrap();
+
+        overwrite_u32(&path, 0, u32::MAX);
+
+        assert!(matches!(
+            SsTableReader::open(&path),
+            Err(Error::Corruption(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_value_length_returns_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("oversized-value.sst");
+        let mut w = SsTableWriter::create(&path).unwrap();
+        w.add(&ik(b"k", 1), &Some(b"v".to_vec())).unwrap();
+        w.finish().unwrap();
+
+        overwrite_u32(&path, 4 + 1 + 8 + 1, u32::MAX);
+
+        assert!(matches!(
+            SsTableReader::open(&path),
+            Err(Error::Corruption(_))
+        ));
     }
 }

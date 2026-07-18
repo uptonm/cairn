@@ -42,8 +42,10 @@ impl WalWriter {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
+        let file_len = file.metadata()?.len();
         let mut r = BufReader::new(file);
         let mut out = Vec::new();
+        let mut valid_len = 0u64;
         loop {
             let mut crc_buf = [0u8; 4];
             match r.read_exact(&mut crc_buf) {
@@ -52,8 +54,10 @@ impl WalWriter {
                 Err(e) => return Err(e.into()),
             }
             let expected_crc = u32::from_le_bytes(crc_buf);
-            match Self::read_body(&mut r)? {
+            let remaining = file_len.saturating_sub(valid_len.saturating_add(4));
+            match Self::read_body(&mut r, remaining)? {
                 Some(body) if crc32fast::hash(&body) == expected_crc => {
+                    valid_len += 4 + body.len() as u64;
                     out.push(Self::decode_body(&body)?);
                 }
                 _ => break, // torn or corrupt tail: stop, keep prefix
@@ -62,30 +66,49 @@ impl WalWriter {
         Ok(out)
     }
 
-    fn read_body<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
+    fn read_body<R: Read>(r: &mut R, remaining: u64) -> Result<Option<Vec<u8>>> {
+        let mut remaining = remaining;
         let mut header = [0u8; 12]; // seqno(8) + klen(4)
+        if remaining < header.len() as u64 {
+            return Ok(None);
+        }
         if read_full_or_eof(r, &mut header)?.is_none() {
             return Ok(None);
         }
-        let klen = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+        remaining -= header.len() as u64;
+        let klen = u64::from(u32::from_le_bytes(header[8..12].try_into().unwrap()));
+        if klen.saturating_add(1) > remaining {
+            return Ok(None);
+        }
+        let klen = klen as usize;
         let mut key = vec![0u8; klen];
         if read_full_or_eof(r, &mut key)?.is_none() {
             return Ok(None);
         }
+        remaining -= klen as u64;
         let mut has_value = [0u8; 1];
         if read_full_or_eof(r, &mut has_value)?.is_none() {
             return Ok(None);
         }
+        remaining -= 1;
         let mut body = Vec::new();
         body.extend_from_slice(&header);
         body.extend_from_slice(&key);
         body.extend_from_slice(&has_value);
         if has_value[0] == 1 {
             let mut vlen_buf = [0u8; 4];
+            if remaining < vlen_buf.len() as u64 {
+                return Ok(None);
+            }
             if read_full_or_eof(r, &mut vlen_buf)?.is_none() {
                 return Ok(None);
             }
-            let vlen = u32::from_le_bytes(vlen_buf) as usize;
+            remaining -= vlen_buf.len() as u64;
+            let vlen = u64::from(u32::from_le_bytes(vlen_buf));
+            if vlen > remaining {
+                return Ok(None);
+            }
+            let vlen = vlen as usize;
             let mut value = vec![0u8; vlen];
             if read_full_or_eof(r, &mut value)?.is_none() {
                 return Ok(None);
@@ -216,5 +239,48 @@ mod tests {
 
         let records = WalWriter::read_all(&path).unwrap();
         assert_eq!(records, vec![(1, b"a".to_vec(), Some(b"1".to_vec()))]);
+    }
+
+    #[test]
+    fn oversized_key_length_stops_at_valid_prefix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut w = WalWriter::create(&path).unwrap();
+        w.append(1, b"a", Some(b"1")).unwrap();
+        drop(w);
+
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&2u64.to_le_bytes()).unwrap();
+        f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        drop(f);
+
+        assert_eq!(
+            WalWriter::read_all(&path).unwrap(),
+            vec![(1, b"a".to_vec(), Some(b"1".to_vec()))]
+        );
+    }
+
+    #[test]
+    fn oversized_value_length_stops_at_valid_prefix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut w = WalWriter::create(&path).unwrap();
+        w.append(1, b"a", Some(b"1")).unwrap();
+        drop(w);
+
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&2u64.to_le_bytes()).unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap();
+        f.write_all(b"k").unwrap();
+        f.write_all(&[1]).unwrap();
+        f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        drop(f);
+
+        assert_eq!(
+            WalWriter::read_all(&path).unwrap(),
+            vec![(1, b"a".to_vec(), Some(b"1".to_vec()))]
+        );
     }
 }
