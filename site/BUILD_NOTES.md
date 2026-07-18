@@ -177,7 +177,7 @@ Route (app)
 ## Known gaps / TODOs
 
 - **Domain**: metadata (`siteConfig.url`), sitemap, and OG tags all point at
-  `https://cairn.uptonm.io`, matching the homelab's `*.uptonm.io` Caddy
+  `https://cairn.uptonm.dev`, matching the homelab's `*.uptonm.io` Caddy
   convention — not yet provisioned or deployed. Confirm before going live.
 - **No dynamic per-doc-page OG images** — every route shares the one root
   `/opengraph-image`. A per-page variant (title overlay) would be a nice

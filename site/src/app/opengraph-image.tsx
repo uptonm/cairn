@@ -41,7 +41,7 @@ export default async function OpengraphImage() {
             <ellipse cx="15.8" cy="7.6" rx="2.6" ry="1.5" />
           </g>
         </svg>
-        <span>cairn.uptonm.io</span>
+        <span>cairn.uptonm.dev</span>
       </div>
       <div
         style={{
