@@ -1,3 +1,4 @@
+pub mod core;
 pub mod error;
 pub mod hardstate;
 pub mod lincheck;
@@ -8,6 +9,7 @@ pub mod storage;
 pub mod transport;
 pub mod types;
 
+pub use core::{Config, RaftCore, ReadToken, Ready, Role};
 pub use error::{Error, Result};
 pub use log::RaftLog;
 pub use rpc::{
