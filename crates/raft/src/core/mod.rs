@@ -390,6 +390,9 @@ mod tests {
         assert_eq!(restarted.role(), Role::Follower);
         assert_eq!(restarted.commit_index(), 0);
         assert_ne!(restarted.commit_index(), pre_commit);
+        // `last_applied` is private but this test module nests inside
+        // `core`, so it's directly reachable — same reset applies to it.
+        assert_eq!(restarted.last_applied, 0);
     }
 
     #[test]
