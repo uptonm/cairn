@@ -2,6 +2,7 @@ import { RootProvider } from "fumadocs-ui/provider/next";
 import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { socialImage } from "@/lib/seo";
 import { siteConfig } from "@/lib/site-config";
 import "./globals.css";
 
@@ -27,34 +28,27 @@ export const metadata: Metadata = {
   keywords: [...siteConfig.keywords],
   authors: [siteConfig.author],
   creator: siteConfig.author.name,
+  publisher: siteConfig.author.name,
   applicationName: siteConfig.name,
+  category: "developer tools",
+  manifest: "/manifest.webmanifest",
   alternates: {
     canonical: "/",
   },
   openGraph: {
     type: "website",
     locale: "en_US",
-    url: siteConfig.url,
+    url: "/",
     siteName: siteConfig.name,
     title: siteConfig.title,
     description: siteConfig.description,
-    images: [
-      {
-        url: "/opengraph-image",
-        width: 1200,
-        height: 630,
-        alt: siteConfig.title,
-      },
-    ],
+    images: [socialImage],
   },
   twitter: {
     card: "summary_large_image",
     title: siteConfig.title,
     description: siteConfig.description,
-    images: ["/opengraph-image"],
-  },
-  icons: {
-    icon: "/icon.svg",
+    images: [socialImage.url],
   },
   robots: {
     index: true,
@@ -85,7 +79,8 @@ const jsonLd = {
   operatingSystem: "Linux, macOS",
   url: siteConfig.url,
   codeRepository: siteConfig.githubUrl,
-  programmingLanguage: ["Rust", "TypeScript"],
+  programmingLanguage: "Rust",
+  isAccessibleForFree: true,
   author: {
     "@type": "Person",
     name: siteConfig.author.name,
@@ -113,7 +108,9 @@ export default function RootLayout({
         <script
           type="application/ld+json"
           // biome-ignore lint/security/noDangerouslySetInnerHtml: static, build-time JSON-LD only
-          dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+          dangerouslySetInnerHTML={{
+            __html: JSON.stringify(jsonLd).replace(/</g, "\\u003c"),
+          }}
         />
       </head>
       <body className="min-h-full flex flex-col">

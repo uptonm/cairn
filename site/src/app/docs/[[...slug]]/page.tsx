@@ -7,7 +7,7 @@ import {
 } from "fumadocs-ui/page";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { siteConfig } from "@/lib/site-config";
+import { createPageMetadata } from "@/lib/seo";
 import { source } from "@/lib/source";
 import { getMDXComponents } from "@/mdx-components";
 
@@ -53,25 +53,11 @@ export async function generateMetadata(props: {
   const { slug } = await props.params;
   const page = source.getPage(slug);
   if (!page) notFound();
+  const path = page.url ?? `/docs${slug?.length ? `/${slug.join("/")}` : ""}`;
 
-  const url = `${siteConfig.url}/docs${slug?.length ? `/${slug.join("/")}` : ""}`;
-
-  return {
+  return createPageMetadata({
     title: page.data.title,
     description: page.data.description,
-    alternates: {
-      canonical: url,
-    },
-    openGraph: {
-      title: page.data.title,
-      description: page.data.description,
-      url,
-      type: "article",
-    },
-    twitter: {
-      card: "summary_large_image",
-      title: page.data.title,
-      description: page.data.description,
-    },
-  };
+    path,
+  });
 }
