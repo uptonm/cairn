@@ -90,6 +90,12 @@ impl<S: RaftStorage> RaftCore<S> {
         self.leader_id = Some(self.config.id);
         self.heartbeat_elapsed = 0;
 
+        // A fresh term means every previously in-flight AppendEntries is
+        // for a leadership/log-extent that may no longer be valid; discard
+        // it rather than risk a stale success being popped against this
+        // term's (re-initialized) next_index/match_index.
+        self.inflight.clear();
+
         let self_id = self.config.id;
         let next = self.storage.last_index() + 1;
         for &peer in &self.config.peers {
@@ -131,6 +137,11 @@ impl<S: RaftStorage> RaftCore<S> {
         }
         self.role = Role::Follower;
         self.leader_id = leader;
+        // Stepping down means this node is no longer tracking replication
+        // progress for anyone; any in-flight AppendEntries bookkeeping is
+        // now meaningless (and would be wrong to resurrect if this node
+        // becomes leader again in a later term).
+        self.inflight.clear();
         self.reset_election_timer();
         Ok(())
     }

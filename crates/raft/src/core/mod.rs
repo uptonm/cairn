@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::error::Result;
 use crate::rpc::Message;
@@ -85,12 +85,18 @@ pub struct RaftCore<S: RaftStorage> {
     votes: BTreeSet<NodeId>,
     next_index: BTreeMap<NodeId, LogIndex>,
     match_index: BTreeMap<NodeId, LogIndex>,
-    /// The "up-to" index of the most recent AppendEntries sent to each
-    /// peer (`prev_log_index + entries.len()`), recorded by
-    /// `send_append_to` so `handle_append_resp` can advance `match_index`
-    /// on success without re-deriving it from the (already-consumed)
-    /// request.
-    last_sent: BTreeMap<NodeId, LogIndex>,
+    /// Per-peer FIFO queue of "up-to" indices (`prev_log_index +
+    /// entries.len()`) for AppendEntries sent but not yet acknowledged,
+    /// pushed by `send_append_to`. Because `last_index` is monotonic
+    /// non-decreasing, the up-to values pushed for a peer are monotonic
+    /// non-decreasing too, so popping front-first on a success always
+    /// yields the SMALLEST outstanding up-to — a safe lower bound on what
+    /// the follower actually persisted for the request being acknowledged,
+    /// even under arbitrary reordering/loss of responses. This is what
+    /// lets `handle_append_resp` advance `match_index` without over-
+    /// advancing it past two overlapping in-flight requests (see the
+    /// Task-4 self-review / Task-4 fix-pass-1 report).
+    inflight: BTreeMap<NodeId, VecDeque<LogIndex>>,
     /// Wired up in Task 4/5 to track per-peer AppendEntries liveness.
     #[allow(dead_code)]
     last_contact_tick: BTreeMap<NodeId, u64>,
@@ -125,7 +131,7 @@ impl<S: RaftStorage> RaftCore<S> {
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
-            last_sent: BTreeMap::new(),
+            inflight: BTreeMap::new(),
             last_contact_tick: BTreeMap::new(),
             tick_count: 0,
             pending_reads: Vec::new(),
@@ -209,6 +215,11 @@ impl<S: RaftStorage> RaftCore<S> {
     #[cfg(test)]
     pub(crate) fn stored_hard_state(&self) -> HardState {
         self.storage.hard_state()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn match_index_of(&self, peer: NodeId) -> LogIndex {
+        self.match_index.get(&peer).copied().unwrap_or(0)
     }
 }
 

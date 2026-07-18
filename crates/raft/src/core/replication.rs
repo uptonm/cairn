@@ -46,15 +46,18 @@ impl<S: RaftStorage> RaftCore<S> {
 
     /// Sends `peer` everything from `next_index[peer]` onward, along with
     /// the immediately preceding (index, term) pair for the consistency
-    /// check. Records `last_sent[peer]` so a later success response can
-    /// advance `match_index` without re-deriving the request's extent.
+    /// check. Pushes this request's "up-to" extent onto `inflight[peer]`
+    /// (FIFO) so a later success response can advance `match_index` by a
+    /// safe lower bound without re-deriving the request's extent — see the
+    /// `inflight` field doc for why FIFO pop-front is safe under
+    /// overlapping in-flight requests.
     fn send_append_to(&mut self, peer: NodeId) -> Result<()> {
         let ni = self.next_index.get(&peer).copied().unwrap_or(1);
         let prev = ni.saturating_sub(1);
         let prev_term = self.term_at(prev)?;
         let entries = self.storage.entries_from(ni);
         let sent_up_to = prev + entries.len() as LogIndex;
-        self.last_sent.insert(peer, sent_up_to);
+        self.inflight.entry(peer).or_default().push_back(sent_up_to);
 
         let req = AppendEntriesReq {
             term: self.current_term(),
@@ -214,18 +217,27 @@ impl<S: RaftStorage> RaftCore<S> {
         }
 
         if resp.success {
-            let sent_up_to = self.last_sent.get(&from).copied().unwrap_or(0);
-            let match_idx = self
-                .match_index
-                .get(&from)
-                .copied()
-                .unwrap_or(0)
-                .max(sent_up_to);
-            self.match_index.insert(from, match_idx);
-            self.next_index.insert(from, match_idx + 1);
+            // Pop the oldest outstanding request's extent, not the newest:
+            // that's the smallest (safe) lower bound on what this peer has
+            // actually persisted, whichever in-flight request this
+            // response corresponds to. An empty queue means a duplicate or
+            // otherwise stale success with nothing left to attribute it
+            // to — don't advance match_index off it.
+            if let Some(up_to) = self.inflight.get_mut(&from).and_then(VecDeque::pop_front) {
+                let match_idx = self.match_index.get(&from).copied().unwrap_or(0).max(up_to);
+                self.match_index.insert(from, match_idx);
+                self.next_index.insert(from, match_idx + 1);
+            }
             self.last_contact_tick.insert(from, self.tick_count);
             self.maybe_advance_commit()?;
         } else {
+            // The peer's log actually conflicts with what we assumed, so
+            // every extent currently in flight to it is void — there's no
+            // request id to single one out, so discard them all rather
+            // than let a later success get attributed to the wrong one.
+            if let Some(queue) = self.inflight.get_mut(&from) {
+                queue.clear();
+            }
             let next = resp.conflict_index.unwrap_or(1).max(1);
             self.next_index.insert(from, next);
             self.send_append_to(from)?;
@@ -464,6 +476,122 @@ mod tests {
         let r = c.ready();
         assert!(r.messages.iter().any(|(to, m)| *to == 2
             && matches!(m, Message::AppendEntries(req) if req.prev_log_index == 0)));
+    }
+
+    // --- match_index safety: FIFO in-flight queue (fix pass 1) ---
+    //
+    // Task 4's self-review flagged that the single scalar `last_sent[peer]`
+    // is overwritten by every send, so two sends to the same peer before a
+    // response arrives collapse to whatever the LAST send recorded — even
+    // if the response actually belongs to an EARLIER, smaller-extent
+    // request. That lets `match_index` jump ahead of what the follower
+    // durably persisted, which is a state-machine-safety violation the
+    // moment Task 5 computes `commit_index` from a majority of
+    // `match_index`. These tests build the exact interleaving by hand
+    // (bypassing the election protocol, which is irrelevant to send/response
+    // bookkeeping) and pin the safe behavior.
+
+    /// A hand-built leader (no election round-trip needed here) with a
+    /// 10-entry log and peer 2 pinned to `next_index = 5`, `match_index = 0`
+    /// — i.e. believed to be far behind. Two overlapping AppendEntries are
+    /// sent before any response is processed: the first covers 5..=10
+    /// (up_to 10), then the log grows to 11 and a second send — still from
+    /// `next_index = 5`, since that only advances on success — covers
+    /// 5..=11 (up_to 11).
+    fn leader_with_two_overlapping_sends() -> RaftCore<MemStorage> {
+        let mut s = MemStorage::default();
+        s.append(
+            &(1..=10)
+                .map(|i| LogEntry {
+                    term: 1,
+                    index: i,
+                    command: vec![],
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut c = RaftCore::new(cfg(1, &[1, 2, 3]), s).unwrap();
+        c.role = Role::Leader;
+        c.leader_id = Some(1);
+        c.next_index.insert(2, 5);
+        c.match_index.insert(2, 0);
+
+        c.send_append_to(2).unwrap(); // up_to = 10
+        let _ = c.ready();
+
+        c.storage
+            .append(&[LogEntry {
+                term: 1,
+                index: 11,
+                command: vec![],
+            }])
+            .unwrap();
+        c.send_append_to(2).unwrap(); // up_to = 11, next_index[2] still 5
+        let _ = c.ready();
+        c
+    }
+
+    fn success_resp(term: Term) -> Message {
+        Message::AppendEntriesResp(AppendEntriesResp {
+            term,
+            success: true,
+            conflict_index: None,
+        })
+    }
+
+    #[test]
+    fn interleaved_sends_do_not_over_advance_match_index() {
+        let mut c = leader_with_two_overlapping_sends();
+        let term = c.current_term();
+
+        // The FIRST request's success arrives. The follower only durably
+        // persisted through 10 (what that request covered) — match_index
+        // must reflect that, not the second (still-unacknowledged)
+        // request's extent of 11. Against the old scalar `last_sent` this
+        // reads back whatever the LAST send recorded (11) regardless of
+        // which response this is — an over-advancement.
+        c.step(2, success_resp(term)).unwrap();
+        assert_eq!(c.match_index_of(2), 10);
+    }
+
+    #[test]
+    fn second_success_converges_match_index_to_the_larger_extent() {
+        let mut c = leader_with_two_overlapping_sends();
+        let term = c.current_term();
+
+        c.step(2, success_resp(term)).unwrap();
+        c.step(2, success_resp(term)).unwrap();
+        assert_eq!(c.match_index_of(2), 11);
+    }
+
+    #[test]
+    fn failure_clears_inflight_so_only_the_resend_can_advance_match_index() {
+        let mut c = leader_with_two_overlapping_sends();
+        let term = c.current_term();
+
+        // Peer rejects: its log actually conflicts, so BOTH previously-sent
+        // extents (10 and 11) are void, not just whichever request this
+        // response happens to correspond to — there's no request id to
+        // match against, so a conservative implementation must discard all
+        // of them.
+        c.step(
+            2,
+            Message::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: false,
+                conflict_index: Some(1),
+            }),
+        )
+        .unwrap();
+        let r = c.ready();
+        assert!(r.messages.iter().any(|(to, m)| *to == 2
+            && matches!(m, Message::AppendEntries(req) if req.prev_log_index == 0)));
+
+        // A single success now must be attributed to the fresh resend (up
+        // to 11, the current log tip), not to the stale pre-failure "10"
+        // that a non-clearing queue would still have at its front.
+        c.step(2, success_resp(term)).unwrap();
+        assert_eq!(c.match_index_of(2), 11);
     }
 
     #[test]
