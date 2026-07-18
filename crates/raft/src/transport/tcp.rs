@@ -1,22 +1,28 @@
 use super::Transport;
 use crate::{Message, NodeId};
-use bincode::Options;
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
+mod codec;
+
+use codec::{
+    read_exact_with_idle_timeout, read_message, serialized_frame_len, write_all_with_idle_timeout,
+    write_frame,
+};
+
 const INBOUND_CHANNEL_CAPACITY: usize = 256;
 const MAX_INBOUND_CONNECTIONS: usize = 32;
 const INBOUND_BYTE_BUDGET: usize = 16 * 1024 * 1024;
-const INBOUND_READ_CHUNK_SIZE: usize = 64 * 1024;
 const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const OUTBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 const INITIAL_ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_ACCEPT_RETRIES: usize = 8;
@@ -24,11 +30,6 @@ const MAX_ACCEPT_RETRIES: usize = 8;
 struct CachedWriter {
     peer_addr: SocketAddr,
     writer: OwnedWriteHalf,
-}
-
-struct EncodedFrame {
-    length: [u8; 4],
-    payload: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -46,13 +47,6 @@ struct InboundMessage {
 struct AcceptFailurePolicy {
     retries: usize,
     next_delay: Duration,
-}
-
-struct ChunkReader<'a> {
-    chunks: &'a [Vec<u8>],
-    chunk_index: usize,
-    chunk_offset: usize,
-    remaining: usize,
 }
 
 type WriterSlot = Arc<Mutex<Option<CachedWriter>>>;
@@ -143,19 +137,19 @@ impl Drop for TcpTransport {
 impl Transport for TcpTransport {
     async fn send(&self, to: NodeId, msg: Message) -> crate::Result<()> {
         self.peer_addr(to).await?;
-        let frame = encode_frame(&msg)?;
         let writer = self.writer_slot(to).await;
         let mut writer = writer.lock().await;
         let peer_addr = self.peer_addr(to).await?;
+        let (payload_len, msg) = size_message(msg).await?;
 
-        if write_frame_once(&mut writer, self.node_id, peer_addr, &frame)
+        if write_frame_once(&mut writer, self.node_id, peer_addr, &msg, payload_len)
             .await
             .is_ok()
         {
             return Ok(());
         }
 
-        write_frame_once(&mut writer, self.node_id, peer_addr, &frame).await
+        write_frame_once(&mut writer, self.node_id, peer_addr, &msg, payload_len).await
     }
 
     async fn recv(&mut self) -> Option<(NodeId, Message)> {
@@ -222,82 +216,49 @@ impl AcceptFailurePolicy {
     }
 }
 
-impl<'a> ChunkReader<'a> {
-    fn new(chunks: &'a [Vec<u8>], payload_len: usize) -> ChunkReader<'a> {
-        ChunkReader {
-            chunks,
-            chunk_index: 0,
-            chunk_offset: 0,
-            remaining: payload_len,
-        }
-    }
-
-    fn remaining(&self) -> usize {
-        self.remaining
-    }
-}
-
-impl Read for ChunkReader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let mut written = 0;
-        while written < buffer.len() && self.chunk_index < self.chunks.len() {
-            let chunk = &self.chunks[self.chunk_index];
-            let available = &chunk[self.chunk_offset..];
-            if available.is_empty() {
-                self.chunk_index += 1;
-                self.chunk_offset = 0;
-                continue;
-            }
-            let copy_len = available.len().min(buffer.len() - written);
-            buffer[written..written + copy_len].copy_from_slice(&available[..copy_len]);
-            written += copy_len;
-            self.chunk_offset += copy_len;
-            self.remaining -= copy_len;
-        }
-        Ok(written)
-    }
-}
-
-fn encode_frame(message: &Message) -> crate::Result<EncodedFrame> {
-    let payload = bincode::serialize(message).map_err(|error| {
-        crate::Error::Corruption(format!("message serialization failed: {error}"))
-    })?;
-    let payload_len = u32::try_from(payload.len()).map_err(|_| {
-        crate::Error::Corruption("message payload does not fit in a u32 frame length".to_string())
-    })?;
-    Ok(EncodedFrame {
-        length: payload_len.to_le_bytes(),
-        payload,
+async fn size_message(message: Message) -> crate::Result<(u32, Message)> {
+    tokio::task::spawn_blocking(move || {
+        serialized_frame_len(&message).map(|payload_len| (payload_len, message))
     })
+    .await
+    .map_err(|error| {
+        io_error(
+            ErrorKind::Other,
+            format!("message size calculation task failed: {error}"),
+        )
+    })?
 }
 
 async fn write_frame_once(
     writer_slot: &mut Option<CachedWriter>,
     node_id: NodeId,
     peer_addr: SocketAddr,
-    frame: &EncodedFrame,
+    message: &Message,
+    payload_len: u32,
 ) -> crate::Result<()> {
     let mut writer = match writer_slot.take() {
         Some(cached) if cached.peer_addr == peer_addr => cached.writer,
         Some(_) | None => connect_writer(node_id, peer_addr).await?,
     };
-    let result = async {
-        writer.write_all(&frame.length).await?;
-        writer.write_all(&frame.payload).await
-    }
-    .await;
-    match result {
+    match write_frame(&mut writer, message, payload_len, OUTBOUND_IDLE_TIMEOUT).await {
         Ok(()) => {
             *writer_slot = Some(CachedWriter { peer_addr, writer });
             Ok(())
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
 }
 
 async fn connect_writer(node_id: NodeId, peer_addr: SocketAddr) -> crate::Result<OwnedWriteHalf> {
-    let mut stream = TcpStream::connect(peer_addr).await?;
-    stream.write_all(&node_id.to_le_bytes()).await?;
+    let mut stream = tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, TcpStream::connect(peer_addr))
+        .await
+        .map_err(|_| {
+            io_error(
+                ErrorKind::TimedOut,
+                format!("TCP connect to {peer_addr} exceeded its deadline"),
+            )
+        })??;
+    write_all_with_idle_timeout(&mut stream, &node_id.to_le_bytes(), OUTBOUND_IDLE_TIMEOUT).await?;
     let (_, writer) = stream.into_split();
     Ok(writer)
 }
@@ -353,33 +314,15 @@ async fn read_stream(
     inbound_budget: InboundBudget,
 ) -> crate::Result<()> {
     let mut handshake = [0; 8];
-    read_exact_with_idle_timeout(&mut stream, &mut handshake).await?;
+    read_exact_with_idle_timeout(&mut stream, &mut handshake, INBOUND_IDLE_TIMEOUT).await?;
     let source_id = NodeId::from_le_bytes(handshake);
 
     loop {
         let mut length = [0; 4];
-        read_exact_with_idle_timeout(&mut stream, &mut length).await?;
+        read_exact_with_idle_timeout(&mut stream, &mut length, INBOUND_IDLE_TIMEOUT).await?;
         let payload_len = u32::from_le_bytes(length) as usize;
         let budget_permit = inbound_budget.acquire(payload_len).await?;
-        let payload = read_payload(&mut stream, payload_len).await?;
-        let message = {
-            let mut payload_reader = ChunkReader::new(&payload, payload_len);
-            let message = bincode::DefaultOptions::new()
-                .with_fixint_encoding()
-                .reject_trailing_bytes()
-                .with_limit(payload_len as u64)
-                .deserialize_from(&mut payload_reader)
-                .map_err(|error| {
-                    crate::Error::Corruption(format!("message deserialization failed: {error}"))
-                })?;
-            if payload_reader.remaining() != 0 {
-                return Err(crate::Error::Corruption(
-                    "message deserialization left trailing payload bytes".to_string(),
-                ));
-            }
-            message
-        };
-        drop(payload);
+        let message = read_message(&mut stream, payload_len, INBOUND_IDLE_TIMEOUT).await?;
         sender
             .send(InboundMessage {
                 source_id,
@@ -396,65 +339,6 @@ async fn read_stream(
     }
 }
 
-async fn read_payload(stream: &mut TcpStream, payload_len: usize) -> crate::Result<Vec<Vec<u8>>> {
-    let chunk_count = payload_len / INBOUND_READ_CHUNK_SIZE
-        + usize::from(!payload_len.is_multiple_of(INBOUND_READ_CHUNK_SIZE));
-    let mut chunks = Vec::new();
-    chunks.try_reserve_exact(chunk_count).map_err(|error| {
-        io_error(
-            ErrorKind::OutOfMemory,
-            format!("cannot allocate incoming frame chunk index: {error}"),
-        )
-    })?;
-
-    let mut remaining = payload_len;
-    while remaining != 0 {
-        let chunk_len = remaining.min(INBOUND_READ_CHUNK_SIZE);
-        let mut chunk = allocate_zeroed_chunk(chunk_len)?;
-        read_exact_with_idle_timeout(stream, &mut chunk).await?;
-        chunks.push(chunk);
-        remaining -= chunk_len;
-    }
-    Ok(chunks)
-}
-
-fn allocate_zeroed_chunk(chunk_len: usize) -> crate::Result<Vec<u8>> {
-    let mut chunk = Vec::new();
-    chunk.try_reserve_exact(chunk_len).map_err(|error| {
-        io_error(
-            ErrorKind::OutOfMemory,
-            format!("cannot allocate incoming frame chunk: {error}"),
-        )
-    })?;
-    chunk.resize(chunk_len, 0);
-    Ok(chunk)
-}
-
-async fn read_exact_with_idle_timeout(
-    stream: &mut TcpStream,
-    mut buffer: &mut [u8],
-) -> crate::Result<()> {
-    while !buffer.is_empty() {
-        let bytes_read = tokio::time::timeout(INBOUND_IDLE_TIMEOUT, stream.read(buffer))
-            .await
-            .map_err(|_| {
-                io_error(
-                    ErrorKind::TimedOut,
-                    "TCP inbound read made no progress before idle deadline",
-                )
-            })??;
-        if bytes_read == 0 {
-            return Err(io_error(
-                ErrorKind::UnexpectedEof,
-                "TCP inbound stream ended before the frame completed",
-            ));
-        }
-        let (_, remaining) = buffer.split_at_mut(bytes_read);
-        buffer = remaining;
-    }
-    Ok(())
-}
-
 fn io_error(kind: ErrorKind, message: impl Into<String>) -> crate::Error {
     std::io::Error::new(kind, message.into()).into()
 }
@@ -462,8 +346,11 @@ fn io_error(kind: ErrorKind, message: impl Into<String>) -> crate::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_zeroed_chunk, AcceptFailurePolicy, InboundBudget, TcpTransport,
-        INBOUND_BYTE_BUDGET,
+        codec::{
+            allocate_bytes, read_message, serialized_frame_len, write_all_with_idle_timeout,
+            write_frame,
+        },
+        AcceptFailurePolicy, InboundBudget, TcpTransport, INBOUND_BYTE_BUDGET,
     };
     use crate::transport::Transport;
     use crate::{
@@ -532,6 +419,61 @@ mod tests {
             }),
             Message::InstallSnapshotResp(InstallSnapshotResp { term: 4 }),
         ]
+    }
+
+    #[tokio::test]
+    async fn incremental_codec_matches_bincode_for_every_message_variant() {
+        for message in all_messages() {
+            let expected_payload = bincode::serialize(&message).unwrap();
+            let payload_len = serialized_frame_len(&message).unwrap();
+            assert_eq!(payload_len as usize, expected_payload.len());
+
+            let (mut encoded, mut encoded_reader) = tokio::io::duplex(expected_payload.len() + 4);
+            write_frame(&mut encoded, &message, payload_len, Duration::from_secs(1))
+                .await
+                .unwrap();
+            let mut actual_frame = vec![0; expected_payload.len() + 4];
+            encoded_reader.read_exact(&mut actual_frame).await.unwrap();
+            let mut expected_frame = payload_len.to_le_bytes().to_vec();
+            expected_frame.extend_from_slice(&expected_payload);
+            assert_eq!(actual_frame, expected_frame);
+
+            let (mut raw_writer, mut raw_reader) = tokio::io::duplex(expected_payload.len());
+            raw_writer.write_all(&expected_payload).await.unwrap();
+            drop(raw_writer);
+            assert_eq!(
+                read_message(
+                    &mut raw_reader,
+                    expected_payload.len(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .unwrap(),
+                message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_idle_timeout_resets_after_each_write_progress() {
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let payload = [0x5a; 8];
+        let slow_reader = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for _ in 0..payload.len() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let mut byte = [0];
+                reader.read_exact(&mut byte).await.unwrap();
+                received.push(byte[0]);
+            }
+            received
+        });
+
+        write_all_with_idle_timeout(&mut writer, &payload, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert_eq!(slow_reader.await.unwrap(), payload);
     }
 
     #[tokio::test]
@@ -653,6 +595,67 @@ mod tests {
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), raw_peer)
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_outbound_write_times_out_and_later_send_reconnects() {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let (release_stalled, release_stalled_received) = oneshot::channel();
+        let stalled_peer = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let (second, _) = listener.accept().await.unwrap();
+            let _ = release_stalled_received.await;
+            drop((first, second));
+            listener
+        });
+        let transport = TcpTransport::bind(
+            1,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            HashMap::from([(2, peer_addr)]),
+        )
+        .await
+        .unwrap();
+        let stalled = Message::InstallSnapshot(InstallSnapshotReq {
+            term: 25,
+            leader_id: 1,
+            last_index: 43,
+            last_term: 24,
+            data: vec![0x3c; 16 * 1024 * 1024],
+        });
+
+        let stalled_result =
+            tokio::time::timeout(Duration::from_secs(4), transport.send(2, stalled)).await;
+        assert!(
+            matches!(stalled_result, Ok(Err(crate::Error::Io(ref error)))
+                if error.kind() == std::io::ErrorKind::TimedOut),
+            "stalled send did not return an outbound idle timeout: {stalled_result:?}"
+        );
+
+        let _ = release_stalled.send(());
+        let listener = stalled_peer.await.unwrap();
+        let expected = Message::RequestVoteResp(RequestVoteResp {
+            term: 26,
+            vote_granted: true,
+        });
+        let recovering_peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut handshake = [0; 8];
+            stream.read_exact(&mut handshake).await.unwrap();
+            assert_eq!(handshake, 1_u64.to_le_bytes());
+            read_raw_message(&mut stream).await
+        });
+
+        transport.send(2, expected.clone()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), recovering_peer)
                 .await
                 .unwrap()
                 .unwrap(),
@@ -1045,8 +1048,8 @@ mod tests {
     }
 
     #[test]
-    fn payload_chunk_allocation_failure_is_recoverable() {
-        assert!(allocate_zeroed_chunk(usize::MAX).is_err());
+    fn message_byte_allocation_failure_is_recoverable() {
+        assert!(allocate_bytes(usize::MAX).is_err());
     }
 
     #[test]
