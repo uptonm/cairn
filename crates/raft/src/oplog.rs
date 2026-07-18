@@ -70,6 +70,7 @@ pub fn read_all_with_len(path: &Path) -> Result<(Vec<Op>, u64)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(Error::Io(e)),
     };
+    let file_len = file.metadata()?.len();
     let mut r = BufReader::new(file);
     let mut out = Vec::new();
     let mut valid_len: u64 = 0;
@@ -81,7 +82,8 @@ pub fn read_all_with_len(path: &Path) -> Result<(Vec<Op>, u64)> {
             Err(e) => return Err(Error::Io(e)),
         }
         let expected_crc = u32::from_le_bytes(crc_buf);
-        match read_body(&mut r)? {
+        let remaining = file_len.saturating_sub(valid_len.saturating_add(4));
+        match read_body(&mut r, remaining)? {
             Some(body) if crc32fast::hash(&body) == expected_crc => match decode(&body) {
                 Some(op) => {
                     valid_len += 4 + body.len() as u64;
@@ -103,19 +105,32 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<bool> {
     }
 }
 
-fn read_body<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
+fn read_body<R: Read>(r: &mut R, remaining: u64) -> Result<Option<Vec<u8>>> {
+    let mut remaining = remaining;
     let mut tag = [0u8; 1];
+    if remaining < tag.len() as u64 {
+        return Ok(None);
+    }
     if !read_exact_or_eof(r, &mut tag)? {
         return Ok(None);
     }
+    remaining -= tag.len() as u64;
     let mut body = vec![tag[0]];
     match tag[0] {
         0 => {
             let mut fixed = [0u8; 20]; // term(8)+index(8)+clen(4)
+            if remaining < fixed.len() as u64 {
+                return Ok(None);
+            }
             if !read_exact_or_eof(r, &mut fixed)? {
                 return Ok(None);
             }
-            let clen = u32::from_le_bytes(fixed[16..20].try_into().unwrap()) as usize;
+            remaining -= fixed.len() as u64;
+            let clen = u64::from(u32::from_le_bytes(fixed[16..20].try_into().unwrap()));
+            if clen > remaining {
+                return Ok(None);
+            }
+            let clen = clen as usize;
             let mut cmd = vec![0u8; clen];
             if !read_exact_or_eof(r, &mut cmd)? {
                 return Ok(None);
@@ -125,6 +140,9 @@ fn read_body<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
         }
         1 => {
             let mut fixed = [0u8; 8];
+            if remaining < fixed.len() as u64 {
+                return Ok(None);
+            }
             if !read_exact_or_eof(r, &mut fixed)? {
                 return Ok(None);
             }
@@ -132,6 +150,9 @@ fn read_body<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
         }
         2 => {
             let mut fixed = [0u8; 24];
+            if remaining < fixed.len() as u64 {
+                return Ok(None);
+            }
             if !read_exact_or_eof(r, &mut fixed)? {
                 return Ok(None);
             }
@@ -222,6 +243,28 @@ mod tests {
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(&[0xDE, 0xAD, 0xBE]).unwrap();
         drop(f);
+        assert_eq!(
+            read_all(&path).unwrap(),
+            vec![Op::Append(entry(1, 1, b"a"))]
+        );
+    }
+
+    #[test]
+    fn oversized_command_length_stops_at_valid_prefix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ops");
+        let mut w = OpWriter::create(&path).unwrap();
+        w.append(&Op::Append(entry(1, 1, b"a"))).unwrap();
+        drop(w);
+
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&[0]).unwrap();
+        f.write_all(&1u64.to_le_bytes()).unwrap();
+        f.write_all(&2u64.to_le_bytes()).unwrap();
+        f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        drop(f);
+
         assert_eq!(
             read_all(&path).unwrap(),
             vec![Op::Append(entry(1, 1, b"a"))]

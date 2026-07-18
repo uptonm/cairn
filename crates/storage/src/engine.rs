@@ -3,10 +3,16 @@ use crate::memtable::Memtable;
 use crate::sstable::{SsTableReader, SsTableWriter};
 use crate::types::{InternalKey, Seqno};
 use crate::wal::WalWriter;
+use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
 
 const MEMTABLE_FLUSH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SSTABLES_BEFORE_COMPACT: usize = 4;
+
+fn fsync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
 
 pub struct Engine {
     dir: PathBuf,
@@ -117,6 +123,7 @@ impl Engine {
         // file, since rename is atomic on POSIX. A crash before this point
         // leaves only an orphaned `.sst.tmp`, which discovery ignores.
         std::fs::rename(&tmp_path, &final_path)?;
+        let _ = fsync_dir(&self.dir);
         self.sstables
             .insert(0, (id, SsTableReader::open(&final_path)?));
 
@@ -170,6 +177,7 @@ impl Engine {
         // discovery ignores, so the store is never left with a truncated
         // compacted table.
         std::fs::rename(&tmp_path, &final_path)?;
+        let _ = fsync_dir(&self.dir);
 
         let old_ids: Vec<u64> = self.sstables.iter().map(|(id, _)| *id).collect();
         self.sstables = vec![(id, SsTableReader::open(&final_path)?)];
@@ -193,6 +201,13 @@ impl Engine {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fsync_dir_accepts_directory() {
+        let dir = tempdir().unwrap();
+        fsync_dir(dir.path()).unwrap();
+    }
 
     #[test]
     fn put_get_delete() {

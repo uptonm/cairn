@@ -1,7 +1,11 @@
 use crate::types::HardState;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
+
+fn fsync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
 
 pub fn save_hard_state(path: &Path, hs: &HardState) -> crate::Result<()> {
     let mut body = Vec::with_capacity(17);
@@ -29,6 +33,13 @@ pub fn save_hard_state(path: &Path, hs: &HardState) -> crate::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    // Losing a persisted vote after restart can permit a double-vote, so
+    // making this directory entry durable is election-safety-critical.
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let _ = fsync_dir(dir);
     Ok(())
 }
 
@@ -65,6 +76,13 @@ pub fn load_hard_state(path: &Path) -> crate::Result<HardState> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fsync_dir_accepts_directory() {
+        let dir = tempdir().unwrap();
+        fsync_dir(dir.path()).unwrap();
+    }
 
     #[test]
     fn save_then_load_roundtrips() {
