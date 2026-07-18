@@ -74,9 +74,9 @@ pub struct RaftCore<S: RaftStorage> {
     role: Role,
     leader_id: Option<NodeId>,
     commit_index: LogIndex,
-    /// Wired up in Task 5 to track the apply-loop's progress against
-    /// `commit_index`.
-    #[allow(dead_code)]
+    /// Tracks the apply-loop's progress against `commit_index`; read/written
+    /// by `advance_apply` (core/replication.rs) and read by the read-index
+    /// quorum-contact gate (core/read_index.rs).
     last_applied: LogIndex,
     /// Ticks elapsed since the last leader contact / election reset.
     elapsed: u64,
@@ -278,6 +278,118 @@ mod tests {
         let r = c.ready();
         assert!(r.messages.iter().any(|(_, m)| matches!(
             m, Message::RequestVote(rv) if rv.pre_vote && rv.term == 1)));
+    }
+
+    // Restart recovery: `RaftCore::new` reloads persisted hard state (term,
+    // vote) and the log from storage, but volatile state (commit_index,
+    // last_applied, role, ...) is never persisted and must reset. This test
+    // drives a real 3-node election + two proposals + majority acks to
+    // build up non-trivial persisted AND volatile state in one incarnation,
+    // reclaims the storage via `into_storage`, constructs a fresh core over
+    // it (modeling a crash + restart), and checks both halves: persisted
+    // state survives (including every committed entry), volatile state
+    // resets to the snapshot boundary rather than carrying over.
+    #[test]
+    fn restart_recovers_persisted_state_and_loses_no_committed_entry() {
+        use crate::rpc::{AppendEntriesResp, RequestVoteResp};
+
+        let config = cfg(1, &[1, 2, 3]);
+        let mut core = RaftCore::new(config.clone(), MemStorage::default()).unwrap();
+
+        // Drive past the election timeout into pre-vote, then win a real
+        // election with a single peer grant (self + peer 2 = quorum of 2/3).
+        for _ in 0..40 {
+            core.tick().unwrap();
+        }
+        assert_eq!(core.role(), Role::PreCandidate);
+        let _ = core.ready();
+        core.step(
+            2,
+            Message::RequestVoteResp(RequestVoteResp {
+                term: 1,
+                vote_granted: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(core.role(), Role::Candidate);
+        let _ = core.ready();
+        core.step(
+            2,
+            Message::RequestVoteResp(RequestVoteResp {
+                term: 1,
+                vote_granted: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(core.role(), Role::Leader);
+        let _ = core.ready(); // drain the no-op broadcast from become_leader
+
+        // Propose two more entries, so the log holds three entries (no-op,
+        // "x", "y") in the leader's term.
+        assert_eq!(core.propose(b"set x=1".to_vec()).unwrap(), Some(2));
+        assert_eq!(core.propose(b"set y=2".to_vec()).unwrap(), Some(3));
+        let _ = core.ready();
+
+        // Peer 2 acks all three outstanding AppendEntries in FIFO order,
+        // taking commit_index (and, via advance_apply, last_applied) to 3 —
+        // self + peer 2 already form a quorum of 3.
+        let term = core.current_term();
+        let success = || {
+            Message::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: true,
+                conflict_index: None,
+            })
+        };
+        core.step(2, success()).unwrap();
+        core.step(2, success()).unwrap();
+        core.step(2, success()).unwrap();
+
+        // Confirm pre-crash state is genuinely non-trivial before we throw
+        // this incarnation away.
+        let pre_term = core.current_term();
+        let pre_commit = core.commit_index();
+        let pre_voted_for = core.stored_hard_state().voted_for;
+        let pre_last_index = core.storage.last_index();
+        let pre_last_term = core.storage.last_term();
+        let pre_entries = core.storage.entries_from(1);
+        assert_eq!(pre_term, 1);
+        assert_eq!(pre_commit, 3);
+        assert_eq!(pre_voted_for, Some(1));
+        assert_eq!(pre_last_index, 3);
+        assert_eq!(pre_last_term, 1);
+        assert_eq!(pre_entries.len(), 3);
+        let pre_ready = core.ready();
+        assert_eq!(pre_ready.apply.len(), 3); // all three applied this incarnation
+
+        // Crash + restart: reclaim the storage (the only thing a real
+        // process would still have) and construct a brand new core over it
+        // with the same config, exactly as a restarting node would.
+        let storage = core.into_storage();
+        let restarted = RaftCore::new(config, storage).unwrap();
+
+        // Persisted state is recovered exactly.
+        assert_eq!(restarted.current_term(), pre_term);
+        assert_eq!(restarted.stored_hard_state().voted_for, pre_voted_for);
+        assert_eq!(restarted.storage.last_index(), pre_last_index);
+        assert_eq!(restarted.storage.last_term(), pre_last_term);
+
+        // No committed entry is lost: the entire log (all of it committed
+        // pre-crash) survives byte-for-byte.
+        assert_eq!(restarted.storage.entries_from(1), pre_entries);
+
+        // Volatile state resets to the snapshot boundary rather than
+        // carrying over the pre-crash view. This is correct Raft, not a
+        // bug: a restarted node has no reliable memory of what it had
+        // confirmed committed via peer acks, so it must re-learn
+        // commit_index from a leader's AppendEntries (leader_commit)
+        // instead of trusting its own stale pre-crash value — assuming the
+        // old commit_index without re-confirmation could let a node apply
+        // an entry that a new leader's log has since diverged from. With
+        // no snapshot, that boundary is 0.
+        assert_eq!(restarted.role(), Role::Follower);
+        assert_eq!(restarted.commit_index(), 0);
+        assert_ne!(restarted.commit_index(), pre_commit);
     }
 
     #[test]
