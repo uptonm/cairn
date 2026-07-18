@@ -1,16 +1,15 @@
 export const siteConfig = {
   name: "cairn",
-  title:
-    "cairn — a from-scratch, Raft-replicated, LSM-backed distributed KV store",
+  title: "cairn — Distributed KV Store in Rust",
   description:
-    "cairn is a distributed key-value store built from scratch in Rust: a custom log-structured merge-tree storage engine, Raft consensus, MVCC transactions, and a sharded control plane. Built to demonstrate hard-systems architecture, not to ship a product.",
+    "A distributed key-value store built from scratch in Rust with a custom LSM engine, Raft consensus, MVCC transactions, and a sharded control plane.",
   shortDescription:
     "A from-scratch, sharded, Raft-replicated, LSM-backed distributed key-value store.",
   url: "https://cairn.uptonm.dev",
   githubUrl: "https://github.com/uptonm/cairn",
   author: {
     name: "Mike Upton",
-    url: "https://github.com/uptonm",
+    url: "https://uptonm.dev",
   },
   keywords: [
     "distributed systems",
