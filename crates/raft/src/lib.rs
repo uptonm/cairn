@@ -4,6 +4,7 @@ pub mod lincheck;
 pub mod log;
 pub mod oplog;
 pub mod rpc;
+pub mod storage;
 pub mod transport;
 pub mod types;
 
@@ -13,5 +14,6 @@ pub use rpc::{
     AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, Message,
     RequestVoteReq, RequestVoteResp,
 };
+pub use storage::{MemStorage, RaftStorage};
 pub use transport::tcp::TcpTransport;
 pub use types::{HardState, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
