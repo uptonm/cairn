@@ -265,6 +265,28 @@ async fn run_scheduler(
             .peek()
             .is_some_and(|delivery| delivery.deadline <= Instant::now())
         {
+            let mut admitted = incoming.len();
+            while admitted != 0 {
+                let batch_size = admitted.min(MAX_INCOMING_BATCH);
+                for _ in 0..batch_size {
+                    match incoming.try_recv() {
+                        Ok(delivery) => pending.push(delivery),
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            admitted = 0;
+                            break;
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            fail_queued_deliveries(&mut incoming, &mut pending);
+                            return;
+                        }
+                    }
+                }
+                admitted = admitted.saturating_sub(batch_size);
+                if admitted != 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+
             if let Some(delivery) = pending.pop() {
                 deliver(delivery, &destinations);
             }
@@ -456,6 +478,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_drop_rules_stack() {
+        let (network, mut endpoints) = InMemoryTransport::cluster([1, 2], 31).unwrap();
+        let one = endpoints.remove(&1).unwrap();
+        let mut two = endpoints.remove(&2).unwrap();
+
+        network.drop_next(1, 2).unwrap();
+        network.drop_next(1, 2).unwrap();
+        one.send(2, message(34)).await.unwrap();
+        one.send(2, message(35)).await.unwrap();
+        one.send(2, message(36)).await.unwrap();
+
+        assert_eq!(two.recv().await, Some((1, message(36))));
+    }
+
+    #[tokio::test]
+    async fn partition_blocks_the_reverse_direction() {
+        let (network, mut endpoints) = InMemoryTransport::cluster([1, 2], 33).unwrap();
+        let mut one = endpoints.remove(&1).unwrap();
+        let two = endpoints.remove(&2).unwrap();
+
+        network.partition(1, 2).unwrap();
+        two.send(1, message(37)).await.unwrap();
+
+        assert!(tokio::time::timeout(Duration::from_millis(10), one.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn applies_directional_delay_before_delivery() {
         let (network, mut endpoints) = InMemoryTransport::cluster([1, 2], 37).unwrap();
         let one = endpoints.remove(&1).unwrap();
@@ -469,6 +520,42 @@ mod tests {
             .is_err());
         send.await.unwrap().unwrap();
         assert_eq!(two.recv().await, Some((1, message(41))));
+    }
+
+    #[tokio::test]
+    async fn zero_delay_clears_a_directional_delay() {
+        let (network, mut endpoints) = InMemoryTransport::cluster([1, 2], 39).unwrap();
+        let one = endpoints.remove(&1).unwrap();
+        let mut two = endpoints.remove(&2).unwrap();
+
+        network.set_delay(1, 2, Duration::from_secs(60)).unwrap();
+        network.set_delay(1, 2, Duration::ZERO).unwrap();
+
+        tokio::time::timeout(Duration::from_millis(50), one.send(2, message(43)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(two.recv().await, Some((1, message(43))));
+    }
+
+    #[tokio::test]
+    async fn heal_preserves_non_partition_faults() {
+        let (network, mut endpoints) = InMemoryTransport::cluster([1, 2], 41).unwrap();
+        let one = endpoints.remove(&1).unwrap();
+        let mut two = endpoints.remove(&2).unwrap();
+
+        network.partition(1, 2).unwrap();
+        network.drop_next(1, 2).unwrap();
+        network.set_delay(1, 2, Duration::from_millis(30)).unwrap();
+        network.heal().unwrap();
+
+        one.send(2, message(45)).await.unwrap();
+        let delayed_send = tokio::spawn(async move { one.send(2, message(46)).await });
+        assert!(tokio::time::timeout(Duration::from_millis(5), two.recv())
+            .await
+            .is_err());
+        delayed_send.await.unwrap().unwrap();
+        assert_eq!(two.recv().await, Some((1, message(46))));
     }
 
     #[tokio::test]
@@ -559,6 +646,60 @@ mod tests {
         );
         assert!(result.unwrap().unwrap().is_ok());
         assert_eq!(destination_receiver.recv().await, Some((1, message(71))));
+    }
+
+    #[tokio::test]
+    async fn scheduler_admits_queued_earlier_deadline_before_timer_delivery() {
+        for sequence in 0..16 {
+            let (incoming, incoming_receiver) = mpsc::unbounded_channel();
+            let (destination, mut destination_receiver) = mpsc::unbounded_channel();
+            let destinations = Arc::new(HashMap::from([(2, destination)]));
+            let now = Instant::now();
+            let later_deadline = now + Duration::from_millis(2);
+            let (later_acknowledgement, _later_result) = oneshot::channel();
+            incoming
+                .send(ScheduledDelivery {
+                    deadline: later_deadline,
+                    sequence,
+                    from: 1,
+                    to: 2,
+                    message: message(73),
+                    acknowledgement: later_acknowledgement,
+                })
+                .unwrap();
+
+            let mut scheduler = Box::pin(run_scheduler(incoming_receiver, destinations));
+            std::future::poll_fn(|context| {
+                assert!(scheduler.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+
+            let (earlier_acknowledgement, _earlier_result) = oneshot::channel();
+            incoming
+                .send(ScheduledDelivery {
+                    deadline: now,
+                    sequence: sequence + 1,
+                    from: 1,
+                    to: 2,
+                    message: message(72),
+                    acknowledgement: earlier_acknowledgement,
+                })
+                .unwrap();
+            tokio::time::sleep_until(later_deadline).await;
+
+            std::future::poll_fn(|context| {
+                assert!(scheduler.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+
+            assert_eq!(
+                destination_receiver.try_recv(),
+                Ok((1, message(72))),
+                "timer delivery overtook an already-queued earlier deadline"
+            );
+        }
     }
 
     #[tokio::test]
