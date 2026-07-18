@@ -13,9 +13,12 @@ The transport layer exposes the frozen `Transport` trait over two implementation
 The in-memory control plane is separate from endpoint ownership so a test harness can
 move every endpoint into a node task while retaining one handle for fault injection.
 Messages admitted to the scheduler receive sequence numbers starting at the supplied
-`seed`; equal-deadline deliveries are ordered by that sequence number (FIFO). The
-constructor must run with an active Tokio runtime because it spawns the scheduler; it
-returns an I/O error otherwise.
+`seed`. Before selecting a due delivery, the scheduler snapshots and cooperatively
+drains all ingress that was already admitted, then selects by earliest deadline and
+sequence number (FIFO for equal deadlines). Bounded batches and yields keep that drain
+live on current-thread runtimes without allowing a continuous producer to postpone a
+due delivery indefinitely. The constructor must run with an active Tokio runtime
+because it spawns the scheduler; it returns an I/O error otherwise.
 
 TCP connections start with an eight-byte little-endian sender node ID. Every subsequent
 frame on that connection is exactly a four-byte little-endian payload length followed
@@ -80,18 +83,23 @@ two delivery attempts; the first uses an eligible cached writer or establishes a
 connection. Any first-attempt failure while connecting, writing the sender handshake,
 or writing the frame leaves no cached writer and triggers one fresh
 connect/handshake/frame attempt. Only a second-attempt failure is returned as an I/O
-error. Updating a peer address makes the cached writer ineligible for reuse.
+error. Connect attempts have a one-second deadline. Sender-handshake and frame writes
+have a one-second idle-progress deadline that restarts after every successful partial
+write, so a slowly progressing large frame is not subject to a one-second total
+deadline. Updating a peer address makes the cached writer ineligible for reuse.
 
 Inbound work has at most 32 reader tasks and a 256-message channel. Frames at or below
 16 MiB reserve their encoded payload size from a shared 16 MiB byte budget, held until
 `recv` removes the message. A frame larger than 16 MiB reserves the entire budget and
 is therefore admitted exclusively rather than rejected; one valid oversized frame can
-consume more than 16 MiB of memory. Frames are read in at most 64 KiB chunks. Every
+consume more than 16 MiB of memory. Framed fields and byte data decode directly into
+the final `Message` allocations without retaining a second encoded payload; byte
+vectors are initialized and read in at most 64 KiB progress increments. Every
 handshake, length, and payload read must make progress within one second; timeout, EOF,
 malformed bincode, trailing bytes, allocation failure, or channel closure closes only
 that reader. Listener accept failures retry with exponential backoff (10 ms through
-1 s) at most eight times, then terminate the listener and abort active readers. Dropping
-`TcpTransport` signals listener shutdown and aborts readers.
+1 s) at most eight times, then terminate the listener and abort active readers.
+Dropping `TcpTransport` signals listener shutdown and aborts readers.
 
 ## Errors and Contract Deviations
 
