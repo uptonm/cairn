@@ -1,3 +1,4 @@
+import { ClerkProvider } from "@clerk/nextjs";
 import { RootProvider } from "fumadocs-ui/provider/next";
 import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
@@ -99,32 +100,34 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="en"
-      suppressHydrationWarning
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
-      <head>
-        <script
-          type="application/ld+json"
-          // biome-ignore lint/security/noDangerouslySetInnerHtml: static, build-time JSON-LD only
-          dangerouslySetInnerHTML={{
-            __html: JSON.stringify(jsonLd).replace(/</g, "\\u003c"),
-          }}
-        />
-      </head>
-      <body className="min-h-full flex flex-col">
-        <RootProvider
-          theme={{
-            attribute: "class",
-            defaultTheme: "dark",
-            enableSystem: true,
-            disableTransitionOnChange: true,
-          }}
-        >
-          <TooltipProvider delay={150}>{children}</TooltipProvider>
-        </RootProvider>
-      </body>
-    </html>
+    <ClerkProvider>
+      <html
+        lang="en"
+        suppressHydrationWarning
+        className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      >
+        <head>
+          <script
+            type="application/ld+json"
+            // biome-ignore lint/security/noDangerouslySetInnerHtml: static, build-time JSON-LD only
+            dangerouslySetInnerHTML={{
+              __html: JSON.stringify(jsonLd).replace(/</g, "\\u003c"),
+            }}
+          />
+        </head>
+        <body className="min-h-full flex flex-col">
+          <RootProvider
+            theme={{
+              attribute: "class",
+              defaultTheme: "dark",
+              enableSystem: true,
+              disableTransitionOnChange: true,
+            }}
+          >
+            <TooltipProvider delay={150}>{children}</TooltipProvider>
+          </RootProvider>
+        </body>
+      </html>
+    </ClerkProvider>
   );
 }
