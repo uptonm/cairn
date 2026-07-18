@@ -82,6 +82,17 @@ impl RaftLog {
         self.entries.retain(|e| e.index < from_index);
         Ok(())
     }
+
+    pub fn compact_prefix(&mut self, up_to: LogIndex, meta: SnapshotMeta) -> Result<()> {
+        debug_assert!(
+            up_to <= self.last_index(),
+            "cannot compact past the log end"
+        );
+        self.writer.append(&Op::Compact { up_to, meta })?;
+        self.entries.retain(|e| e.index > up_to);
+        self.snapshot = meta;
+        Ok(())
+    }
 }
 
 fn apply_op(entries: &mut Vec<LogEntry>, snapshot: &mut SnapshotMeta, op: Op) {
@@ -152,5 +163,75 @@ mod tests {
         let log = RaftLog::open(dir.path()).unwrap();
         assert_eq!(log.last_index(), 1);
         assert_eq!(log.entry(2), None);
+    }
+
+    #[test]
+    fn compact_prefix_drops_covered_entries() {
+        let dir = tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[e(1, 1), e(1, 2), e(2, 3), e(2, 4)]).unwrap();
+        log.compact_prefix(
+            2,
+            SnapshotMeta {
+                last_index: 2,
+                last_term: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(log.entry(1), None);
+        assert_eq!(log.entry(2), None);
+        assert_eq!(log.entry(3), Some(&e(2, 3)));
+        assert_eq!(log.last_index(), 4);
+        assert_eq!(
+            log.snapshot_meta(),
+            SnapshotMeta {
+                last_index: 2,
+                last_term: 1
+            }
+        );
+    }
+
+    #[test]
+    fn compact_to_empty_reports_snapshot_as_last() {
+        let dir = tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[e(1, 1), e(3, 2)]).unwrap();
+        log.compact_prefix(
+            2,
+            SnapshotMeta {
+                last_index: 2,
+                last_term: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(log.last_index(), 2);
+        assert_eq!(log.last_term(), 3);
+    }
+
+    #[test]
+    fn compaction_survives_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut log = RaftLog::open(dir.path()).unwrap();
+            log.append(&[e(1, 1), e(1, 2), e(2, 3)]).unwrap();
+            log.compact_prefix(
+                1,
+                SnapshotMeta {
+                    last_index: 1,
+                    last_term: 1,
+                },
+            )
+            .unwrap();
+        }
+        let log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.entry(1), None);
+        assert_eq!(log.entry(2), Some(&e(1, 2)));
+        assert_eq!(
+            log.snapshot_meta(),
+            SnapshotMeta {
+                last_index: 1,
+                last_term: 1
+            }
+        );
     }
 }
