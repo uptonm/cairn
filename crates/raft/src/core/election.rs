@@ -3,8 +3,10 @@ use crate::rpc::{RequestVoteReq, RequestVoteResp};
 
 impl<S: RaftStorage> RaftCore<S> {
     /// Number of votes (including our own) needed to win an election over
-    /// `config.peers` (which includes self).
-    fn quorum(&self) -> usize {
+    /// `config.peers` (which includes self). Also the majority threshold
+    /// `maybe_advance_commit` (replication.rs) uses for `match_index`
+    /// counting — same cluster, same majority definition.
+    pub(super) fn quorum(&self) -> usize {
         self.config.peers.len() / 2 + 1
     }
 

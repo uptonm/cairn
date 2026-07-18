@@ -189,6 +189,7 @@ impl<S: RaftStorage> RaftCore<S> {
         if new_commit > self.commit_index {
             self.commit_index = new_commit;
         }
+        self.advance_apply();
 
         self.outbox.push((
             from,
@@ -245,12 +246,81 @@ impl<S: RaftStorage> RaftCore<S> {
         Ok(())
     }
 
-    /// No-op stub. Task 5 fills this in with the majority-match commit
-    /// advancement rule (only committing entries replicated to a majority
-    /// AND originally written in the leader's current term, per Raft
-    /// §5.4.2).
+    /// Leader-only majority-match commit advancement, per Raft §5.4.2: an
+    /// index `N` becomes committed only once a majority of `match_index`
+    /// values reach it *and* the entry actually stored at `N` was written
+    /// in the leader's current term. Counting replicas alone is not
+    /// sufficient for a prior-term entry — it can still be overwritten by a
+    /// future leader that never learns it was "majority-replicated" here,
+    /// so committing it now (and letting a state machine observe it) would
+    /// be a safety violation the moment that overwrite happens. Once a
+    /// majority reaches a *current-term* `N`, though, the Log Matching
+    /// property guarantees every entry at or below `N` on those replicas is
+    /// identical to the leader's, so committing `N` implicitly commits
+    /// everything below it too — no separate check needed for those.
+    ///
+    /// `commit_index` only ever moves forward: we scan candidate indices
+    /// from `last_index()` down to `commit_index + 1` and take the first
+    /// (i.e. highest) one that qualifies, which is always `>= commit_index`
+    /// by construction of the scan range.
     fn maybe_advance_commit(&mut self) -> Result<()> {
+        if self.role != Role::Leader {
+            return Ok(());
+        }
+        let current_term = self.current_term();
+        let quorum = self.quorum();
+        let last_index = self.storage.last_index();
+
+        let mut n = last_index;
+        while n > self.commit_index {
+            let acked = self
+                .config
+                .peers
+                .iter()
+                .filter(|&&peer| self.match_index.get(&peer).copied().unwrap_or(0) >= n)
+                .count();
+            if acked >= quorum && self.storage.term(n)? == Some(current_term) {
+                self.commit_index = n;
+                break;
+            }
+            n -= 1;
+        }
+
+        self.advance_apply();
         Ok(())
+    }
+
+    /// Moves `last_applied` up to `commit_index` (all roles — leader after
+    /// `maybe_advance_commit`, follower after adopting `leader_commit`),
+    /// pushing a clone of each newly-applied entry into `apply_buf` for the
+    /// caller to drain via `ready()`. Entries at or below the snapshot
+    /// boundary are skipped (their effects are already captured by the
+    /// snapshot, so `entries_from` won't even return them) but
+    /// `last_applied` still advances past them. An entry written in the
+    /// current term flips `readable_term`, which is what lets a leader
+    /// start serving linearizable reads (Task 6) — it now knows it has
+    /// applied at least one entry from its own term, per §8.
+    fn advance_apply(&mut self) {
+        if self.last_applied >= self.commit_index {
+            return;
+        }
+        let snapshot_last = self.storage.snapshot_meta().last_index;
+        let current_term = self.current_term();
+        let target = self.commit_index;
+        let mut pending = self.storage.entries_from(self.last_applied + 1).into_iter();
+
+        while self.last_applied < target {
+            self.last_applied += 1;
+            if self.last_applied <= snapshot_last {
+                continue;
+            }
+            if let Some(entry) = pending.next() {
+                if entry.term == current_term {
+                    self.readable_term = Some(current_term);
+                }
+                self.apply_buf.push(entry);
+            }
+        }
     }
 }
 
@@ -592,6 +662,149 @@ mod tests {
         // that a non-clearing queue would still have at its front.
         c.step(2, success_resp(term)).unwrap();
         assert_eq!(c.match_index_of(2), 11);
+    }
+
+    // --- Task 5: commit-index advancement + apply buffering ---
+
+    #[test]
+    fn commit_advances_on_majority_current_term() {
+        let mut c = elect_leader(1, &[1, 2, 3]);
+        let term = c.current_term();
+        assert_eq!(c.commit_index(), 0);
+
+        // Peer 2 acks the leader's term-1 no-op (index 1). Self already
+        // counts (match_index[1] == 1), so this single ack reaches quorum
+        // (2 of 3) and the entry is from the current term.
+        c.step(2, success_resp(term)).unwrap();
+
+        assert_eq!(c.commit_index(), 1);
+        let r = c.ready();
+        assert_eq!(r.apply.len(), 1);
+        assert_eq!(r.apply[0].index, 1);
+        assert_eq!(r.apply[0].term, term);
+    }
+
+    /// Hand-built leader at term 2 whose log already holds a term-1 entry
+    /// (index 1) followed by the term-2 leader no-op (index 2). Peers start
+    /// believed to have nothing, so the test controls exactly how far each
+    /// peer's acks advance `match_index` via the `inflight` FIFO, the same
+    /// technique `leader_with_two_overlapping_sends` above uses.
+    fn leader_term2_prior_and_current_entries() -> RaftCore<MemStorage> {
+        let mut s = MemStorage::default();
+        s.append(&[
+            LogEntry {
+                term: 1,
+                index: 1,
+                command: vec![],
+            },
+            LogEntry {
+                term: 2,
+                index: 2,
+                command: vec![],
+            },
+        ])
+        .unwrap();
+        s.save_hard_state(&HardState {
+            current_term: 2,
+            voted_for: Some(1),
+        })
+        .unwrap();
+        let mut c = RaftCore::new(cfg(1, &[1, 2, 3]), s).unwrap();
+        c.role = Role::Leader;
+        c.leader_id = Some(1);
+        c.match_index.insert(1, 2); // self already has both entries
+        c.next_index.insert(1, 3);
+        for peer in [2, 3] {
+            c.next_index.insert(peer, 1);
+            c.match_index.insert(peer, 0);
+        }
+        c
+    }
+
+    #[test]
+    fn no_commit_of_prior_term_by_count_alone() {
+        let mut c = leader_term2_prior_and_current_entries();
+        let term = c.current_term();
+        assert_eq!(term, 2);
+
+        // Peer 2 acks up through index 1 only (the term-1 entry).
+        c.inflight.entry(2).or_default().push_back(1);
+        c.step(2, success_resp(term)).unwrap();
+        assert_eq!(c.match_index_of(2), 1);
+
+        // A majority (self + peer 2) now has the term-1 entry, but §5.4.2
+        // forbids committing it by replica count alone: index 1 is not a
+        // current-term entry.
+        assert_eq!(c.commit_index(), 0);
+        assert!(c.ready().apply.is_empty());
+
+        // Peer 2 now also acks the term-2 entry (index 2): a majority
+        // reaches index 2, which IS current-term, so both 1 and 2 commit
+        // together in one jump.
+        c.inflight.entry(2).or_default().push_back(2);
+        c.step(2, success_resp(term)).unwrap();
+        assert_eq!(c.commit_index(), 2);
+        let r = c.ready();
+        let indices: Vec<_> = r.apply.iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![1, 2]);
+    }
+
+    #[test]
+    fn apply_is_in_order_and_once() {
+        let mut c = elect_leader(1, &[1, 2, 3]);
+        let term = c.current_term();
+        c.propose(b"a".to_vec()).unwrap(); // index 2
+        c.propose(b"b".to_vec()).unwrap(); // index 3
+        let _ = c.ready(); // drain AppendEntries messages
+
+        // Peer 2 acks each outstanding request in FIFO order (no-op,
+        // then "a", then "b"), advancing commit_index one step at a time.
+        c.step(2, success_resp(term)).unwrap();
+        c.step(2, success_resp(term)).unwrap();
+        c.step(2, success_resp(term)).unwrap();
+
+        assert_eq!(c.commit_index(), 3);
+        let r = c.ready();
+        let indices: Vec<_> = r.apply.iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![1, 2, 3]);
+
+        // Nothing new committed since the last ready() -> empty apply.
+        let r2 = c.ready();
+        assert!(r2.apply.is_empty());
+    }
+
+    #[test]
+    fn follower_applies_up_to_min_leader_commit_last_index() {
+        let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), MemStorage::default()).unwrap();
+        c.step(
+            1,
+            Message::AppendEntries(AppendEntriesReq {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: 1,
+                        index: 1,
+                        command: b"a".to_vec(),
+                    },
+                    LogEntry {
+                        term: 1,
+                        index: 2,
+                        command: b"b".to_vec(),
+                    },
+                ],
+                leader_commit: 5, // beyond this follower's last_index (2)
+            }),
+        )
+        .unwrap();
+
+        // Clamped to last_index, not the (out-of-range) leader_commit.
+        assert_eq!(c.commit_index(), 2);
+        let r = c.ready();
+        let indices: Vec<_> = r.apply.iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![1, 2]);
     }
 
     #[test]
