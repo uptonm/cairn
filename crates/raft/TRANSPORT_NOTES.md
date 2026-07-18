@@ -78,6 +78,10 @@ Each following message is a four-byte little-endian `u32` payload length followe
 bincode-serialized `Message`. The inbound reader pairs the connection's handshake ID
 with every decoded frame for `recv`.
 
+Outbound `send` sizes the frame with arithmetic over `Vec::len` (never scans command or
+snapshot bytes). Multi-entry `AppendEntries` yields between entries so sizing stays
+cancellable on the calling task; a single-entry payload completes without yielding.
+
 Outbound writers are opened lazily and cached per peer address. Each `send` makes up to
 two delivery attempts; the first uses an eligible cached writer or establishes a fresh
 connection. Any first-attempt failure while connecting, writing the sender handshake,

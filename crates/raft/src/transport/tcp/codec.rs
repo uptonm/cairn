@@ -15,11 +15,39 @@ struct FrameReader<'a, R> {
 }
 
 pub(super) fn serialized_frame_len(message: &Message) -> crate::Result<u32> {
-    let payload_len = bincode::serialized_size(message).map_err(|error| {
-        crate::Error::Corruption(format!("message size calculation failed: {error}"))
-    })?;
-    u32::try_from(payload_len).map_err(|_| {
+    u32::try_from(encoded_payload_len(message)?).map_err(|_| {
         crate::Error::Corruption("message payload does not fit in a u32 frame length".to_string())
+    })
+}
+
+/// Bincode payload length using `Vec::len` for byte fields — never scans command/snapshot bytes.
+pub(super) fn encoded_payload_len(message: &Message) -> crate::Result<usize> {
+    match message {
+        Message::RequestVote(_) => Ok(4 + 8 + 8 + 8 + 8 + 1),
+        Message::RequestVoteResp(_) => Ok(4 + 8 + 1),
+        Message::AppendEntries(request) => {
+            let mut len = 4 + 8 + 8 + 8 + 8 + 8;
+            for entry in &request.entries {
+                len = add_log_entry_len(len, entry)?;
+            }
+            checked_add(len, 8)
+        }
+        Message::AppendEntriesResp(response) => match response.conflict_index {
+            Some(_) => Ok(4 + 8 + 1 + 1 + 8),
+            None => Ok(4 + 8 + 1 + 1),
+        },
+        Message::InstallSnapshot(request) => checked_add(4 + 8 + 8 + 8 + 8 + 8, request.data.len()),
+        Message::InstallSnapshotResp(_) => Ok(4 + 8),
+    }
+}
+
+pub(super) fn add_log_entry_len(len: usize, entry: &LogEntry) -> crate::Result<usize> {
+    checked_add(checked_add(len, 24)?, entry.command.len())
+}
+
+fn checked_add(left: usize, right: usize) -> crate::Result<usize> {
+    left.checked_add(right).ok_or_else(|| {
+        crate::Error::Corruption("message size calculation overflowed usize".to_string())
     })
 }
 

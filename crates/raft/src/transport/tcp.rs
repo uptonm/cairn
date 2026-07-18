@@ -13,8 +13,8 @@ use tokio::task::{JoinHandle, JoinSet};
 mod codec;
 
 use codec::{
-    read_exact_with_idle_timeout, read_message, serialized_frame_len, write_all_with_idle_timeout,
-    write_frame,
+    add_log_entry_len, read_exact_with_idle_timeout, read_message, serialized_frame_len,
+    write_all_with_idle_timeout, write_frame,
 };
 
 const INBOUND_CHANNEL_CAPACITY: usize = 256;
@@ -217,16 +217,29 @@ impl AcceptFailurePolicy {
 }
 
 async fn size_message(message: Message) -> crate::Result<(u32, Message)> {
-    tokio::task::spawn_blocking(move || {
-        serialized_frame_len(&message).map(|payload_len| (payload_len, message))
-    })
-    .await
-    .map_err(|error| {
-        io_error(
-            ErrorKind::Other,
-            format!("message size calculation task failed: {error}"),
-        )
-    })?
+    let payload_len = match &message {
+        Message::AppendEntries(request) => {
+            // Yield between entries so a long AppendEntries can be cancelled without
+            // scanning command bytes on a blocking pool thread.
+            let mut len = 4 + 8 + 8 + 8 + 8 + 8;
+            for (index, entry) in request.entries.iter().enumerate() {
+                if index > 0 {
+                    tokio::task::yield_now().await;
+                }
+                len = add_log_entry_len(len, entry)?;
+            }
+            let len = len.checked_add(8).ok_or_else(|| {
+                crate::Error::Corruption("message size calculation overflowed usize".to_string())
+            })?;
+            u32::try_from(len).map_err(|_| {
+                crate::Error::Corruption(
+                    "message payload does not fit in a u32 frame length".to_string(),
+                )
+            })?
+        }
+        _ => serialized_frame_len(&message)?,
+    };
+    Ok((payload_len, message))
 }
 
 async fn write_frame_once(
@@ -350,7 +363,7 @@ mod tests {
             allocate_bytes, read_message, serialized_frame_len, write_all_with_idle_timeout,
             write_frame,
         },
-        AcceptFailurePolicy, InboundBudget, TcpTransport, INBOUND_BYTE_BUDGET,
+        size_message, AcceptFailurePolicy, InboundBudget, TcpTransport, INBOUND_BYTE_BUDGET,
     };
     use crate::transport::Transport;
     use crate::{
@@ -358,8 +371,10 @@ mod tests {
         Message, RequestVoteReq, RequestVoteResp,
     };
     use std::collections::{HashMap, HashSet};
+    use std::future::Future;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::task::Poll;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -421,9 +436,55 @@ mod tests {
         ]
     }
 
+    fn codec_messages() -> Vec<Message> {
+        let mut messages = all_messages();
+        messages.extend([
+            Message::AppendEntries(AppendEntriesReq {
+                term: 5,
+                leader_id: 8,
+                prev_log_index: 12,
+                prev_log_term: 4,
+                entries: Vec::new(),
+                leader_commit: 12,
+            }),
+            Message::AppendEntries(AppendEntriesReq {
+                term: 6,
+                leader_id: 8,
+                prev_log_index: 13,
+                prev_log_term: 5,
+                entries: vec![
+                    LogEntry {
+                        term: 6,
+                        index: 14,
+                        command: Vec::new(),
+                    },
+                    LogEntry {
+                        term: 6,
+                        index: 15,
+                        command: b"second command".to_vec(),
+                    },
+                ],
+                leader_commit: 13,
+            }),
+            Message::AppendEntriesResp(AppendEntriesResp {
+                term: 6,
+                success: true,
+                conflict_index: None,
+            }),
+            Message::InstallSnapshot(InstallSnapshotReq {
+                term: 7,
+                leader_id: 8,
+                last_index: 15,
+                last_term: 6,
+                data: Vec::new(),
+            }),
+        ]);
+        messages
+    }
+
     #[tokio::test]
     async fn incremental_codec_matches_bincode_for_every_message_variant() {
-        for message in all_messages() {
+        for message in codec_messages() {
             let expected_payload = bincode::serialize(&message).unwrap();
             let payload_len = serialized_frame_len(&message).unwrap();
             assert_eq!(payload_len as usize, expected_payload.len());
@@ -452,6 +513,67 @@ mod tests {
                 message
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sizing_large_command_completes_without_background_scanning() {
+        const COMMAND_LEN: usize = 32 * 1024 * 1024;
+
+        let message = Message::AppendEntries(AppendEntriesReq {
+            term: 8,
+            leader_id: 9,
+            prev_log_index: 15,
+            prev_log_term: 7,
+            entries: vec![LogEntry {
+                term: 8,
+                index: 16,
+                command: vec![0x4d; COMMAND_LEN],
+            }],
+            leader_commit: 15,
+        });
+        let mut sizing = Box::pin(size_message(message));
+
+        let (payload_len, message) =
+            std::future::poll_fn(|context| match sizing.as_mut().poll(context) {
+                Poll::Ready(result) => Poll::Ready(result),
+                Poll::Pending => {
+                    panic!("single-entry sizing detached or yielded while scanning command bytes")
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(payload_len as usize, 52 + 24 + COMMAND_LEN);
+        drop(message);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_entry_sizing_exposes_a_bounded_cancellation_point() {
+        let message = Message::AppendEntries(AppendEntriesReq {
+            term: 9,
+            leader_id: 10,
+            prev_log_index: 16,
+            prev_log_term: 8,
+            entries: (0..128)
+                .map(|offset| LogEntry {
+                    term: 9,
+                    index: 17 + offset,
+                    command: Vec::new(),
+                })
+                .collect(),
+            leader_commit: 16,
+        });
+        let mut sizing = Box::pin(size_message(message));
+
+        std::future::poll_fn(|context| {
+            assert!(
+                sizing.as_mut().poll(context).is_pending(),
+                "entry metadata sizing did not yield at its bounded cancellation point"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        drop(sizing);
     }
 
     #[tokio::test]
