@@ -80,27 +80,32 @@ evicts the writer and the same `send` makes one fresh connection/write attempt; 
 second attempt is returned as an I/O error. Updating a peer address makes the cached
 writer ineligible for reuse.
 
-Inbound work is bounded: at most 32 reader tasks, a 256-message inbound channel, and a
-16 MiB payload-byte budget held until `recv` removes a message. Frames are read in at
-most 64 KiB chunks. Every handshake, length, and payload read must make progress within
-one second; timeout, EOF, malformed bincode, trailing bytes, allocation failure, or
-channel closure closes only that reader. Listener accept failures retry with exponential
-backoff (10 ms through 1 s) at most eight times, then terminate the listener and abort
-active readers. Dropping `TcpTransport` signals listener shutdown and aborts readers.
+Inbound work has at most 32 reader tasks and a 256-message channel. Frames at or below
+16 MiB reserve their encoded payload size from a shared 16 MiB byte budget, held until
+`recv` removes the message. A frame larger than 16 MiB reserves the entire budget and
+is therefore admitted exclusively rather than rejected; one valid oversized frame can
+consume more than 16 MiB of memory. Frames are read in at most 64 KiB chunks. Every
+handshake, length, and payload read must make progress within one second; timeout, EOF,
+malformed bincode, trailing bytes, allocation failure, or channel closure closes only
+that reader. Listener accept failures retry with exponential backoff (10 ms through
+1 s) at most eight times, then terminate the listener and abort active readers. Dropping
+`TcpTransport` signals listener shutdown and aborts readers.
 
 ## Errors and Contract Deviations
 
-Unknown peers, listener and connection failures, and frame writes return the crate's
-existing I/O error. Serialization and malformed-frame failures use the existing
-corruption error. A malformed inbound TCP connection is closed without stopping the
-node listener unless accept failures exhaust the retry budget.
+Listener bind failures are returned by `bind`; unknown peers and outbound connect or
+frame-write failures are returned by `send`, all as the crate's existing I/O error.
+Serialization and malformed-frame failures use the existing corruption error. Inbound
+connection read failures close only that reader. Accept-retry exhaustion terminates the
+listener, aborts its readers, and closes inbound delivery; it is not returned as an I/O
+error.
 
 The sender-ID handshake is protocol metadata required to implement
 `Transport::recv(&mut self) -> Option<(NodeId, Message)>`, because `Message` has no
 sender field. It is therefore an intentional wire-level addition beyond the frozen
-message values. The trait has no error return from `recv`, so listener termination and
-inbound-channel closure surface as `None`, rather than a listener error. There are no
-other deviations from the frozen user contract.
+message values. The trait has no error return from `recv`, so accept-retry exhaustion
+and the resulting inbound-channel closure surface as `recv() == None`, rather than a
+listener error. There are no other deviations from the frozen user contract.
 
 # Historical Raft Transport Implementation Plan
 
