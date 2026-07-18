@@ -94,19 +94,27 @@ impl Engine {
         }
         let id = self.next_sst_id;
         self.next_sst_id += 1;
-        let path = self.dir.join(format!("{id:06}.sst"));
-        let mut w = SsTableWriter::create(&path)?;
+        let final_path = self.dir.join(format!("{id:06}.sst"));
+        let tmp_path = self.dir.join(format!("{id:06}.sst.tmp"));
+        let mut w = SsTableWriter::create(&tmp_path)?;
         for (ik, value) in self.memtable.iter() {
             w.add(ik, value)?;
         }
         w.finish()?;
-        self.sstables.insert(0, (id, SsTableReader::open(&path)?));
+        // Atomically publish: a discoverable `.sst` is only ever a complete
+        // file, since rename is atomic on POSIX. A crash before this point
+        // leaves only an orphaned `.sst.tmp`, which discovery ignores.
+        std::fs::rename(&tmp_path, &final_path)?;
+        self.sstables
+            .insert(0, (id, SsTableReader::open(&final_path)?));
 
-        // Reset memtable and WAL: durability now lives in the SSTable.
-        self.memtable = Memtable::new();
+        // Rotate the WAL before clearing the memtable: if WAL rotation
+        // fails, the memtable must still hold the data (it's also safely
+        // in the just-published SSTable, so this is redundant, not lost).
         let wal_path = self.dir.join("wal.log");
         std::fs::remove_file(&wal_path)?;
         self.wal = WalWriter::create(&wal_path)?;
+        self.memtable = Memtable::new();
         Ok(())
     }
 }
@@ -166,6 +174,16 @@ mod tests {
         e.flush().unwrap();
         e.delete(b"k").unwrap();
         e.flush().unwrap();
+        assert_eq!(e.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn unflushed_delete_shadows_flushed_value() {
+        let dir = tempdir().unwrap();
+        let mut e = Engine::open(dir.path()).unwrap();
+        e.put(b"k", b"v").unwrap();
+        e.flush().unwrap();
+        e.delete(b"k").unwrap();
         assert_eq!(e.get(b"k").unwrap(), None);
     }
 
