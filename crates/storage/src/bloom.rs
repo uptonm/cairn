@@ -41,10 +41,13 @@ impl Bloom {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Bloom> {
-        if bytes.len() < 4 {
+        if bytes.len() < 12 {
             return Err(Error::Corruption("bloom too short".into()));
         }
         let k = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if !(1..=30).contains(&k) {
+            return Err(Error::Corruption("bloom k out of range".into()));
+        }
         Ok(Bloom {
             bits: bytes[4..].to_vec(),
             k,
@@ -94,5 +97,20 @@ mod tests {
         let restored = Bloom::from_bytes(&b.to_bytes()).unwrap();
         assert!(restored.contains(b"x"));
         assert!(restored.contains(b"y"));
+    }
+
+    #[test]
+    fn from_bytes_rejects_empty_bits() {
+        let result = Bloom::from_bytes(&[0, 0, 0, 5]);
+        assert!(matches!(result, Err(Error::Corruption(_))));
+    }
+
+    #[test]
+    fn from_bytes_rejects_out_of_range_k() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1000u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        let result = Bloom::from_bytes(&buf);
+        assert!(matches!(result, Err(Error::Corruption(_))));
     }
 }
