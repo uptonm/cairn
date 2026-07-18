@@ -48,7 +48,7 @@ impl SplitMix64 {
 }
 
 /// A snapshot of one node's applied log taken at a moment it was observed to
-/// be `Role::Leader`, used by `assert_leader_completeness`.
+/// be `Role::Leader`, used by `assert_leader_completeness_pairwise`.
 struct LeaderSnapshot {
     term: Term,
     leader: NodeId,
@@ -86,6 +86,22 @@ struct Cluster {
     /// material for `assert_election_safety`.
     leader_observations: Vec<(Term, NodeId)>,
     leader_snapshots: Vec<LeaderSnapshot>,
+    /// Canonical committed history: an entry lands here the first time ANY
+    /// node applies it (a node only ever applies committed entries, so
+    /// "applied somewhere" is exactly "committed"). `record_committed`
+    /// asserts a newly observed entry never conflicts with what's already
+    /// recorded at that index — a second state-machine-safety check,
+    /// independent of `assert_log_agreement`'s pairwise scan. This is the
+    /// ground truth `assert_leader_completeness_containment` checks a
+    /// settled leader against.
+    committed_by_index: BTreeMap<LogIndex, LogEntry>,
+    /// Count of `deliver_one` calls, while `reorder` is on, that picked a
+    /// queue position other than the front from a queue with more than one
+    /// candidate — i.e. a delivery provably NOT in FIFO order. Used by
+    /// `reordered_delivery` to prove reordering actually happened rather
+    /// than merely running with the flag set on a queue that never had more
+    /// than one message in it.
+    non_fifo_deliveries: usize,
 }
 
 impl Cluster {
@@ -127,6 +143,8 @@ impl Cluster {
             rng: SplitMix64::new(seed ^ 0xA5A5_A5A5_A5A5_A5A5),
             leader_observations: Vec::new(),
             leader_snapshots: Vec::new(),
+            committed_by_index: BTreeMap::new(),
+            non_fifo_deliveries: 0,
         }
     }
 
@@ -179,7 +197,28 @@ impl Cluster {
             "node {} applied out of order or with a gap: expected index {expected}, got {}",
             self.ids[idx], entry.index
         );
+        self.record_committed(entry.clone());
         self.applied[idx].push(entry);
+    }
+
+    /// Records `entry` as committed the first time any node applies it. If
+    /// this index was already recorded, asserts the content matches exactly
+    /// — two different entries ever being committed at the same index would
+    /// itself be a state-machine-safety violation, independent of which
+    /// nodes observed which one.
+    fn record_committed(&mut self, entry: LogEntry) {
+        match self.committed_by_index.get(&entry.index) {
+            Some(existing) => assert_eq!(
+                existing, &entry,
+                "COMMITTED HISTORY CONFLICT at index {}: previously observed {existing:?}, now \
+                 {entry:?} — two different entries committed at the same index \
+                 (state machine safety violation)",
+                entry.index
+            ),
+            None => {
+                self.committed_by_index.insert(entry.index, entry);
+            }
+        }
     }
 
     fn record_leader_if_leading(&mut self, idx: usize) {
@@ -249,6 +288,9 @@ impl Cluster {
         } else {
             0
         };
+        if self.reorder && pick != 0 && self.inflight.len() > 1 {
+            self.non_fifo_deliveries += 1;
+        }
         let (from, to, msg) = self.inflight.remove(pick);
         let Some(&idx) = self.index_of.get(&to) else {
             return true; // unknown recipient: nothing to do, message is lost
@@ -362,12 +404,71 @@ impl Cluster {
         self.reorder = on;
     }
 
+    fn non_fifo_deliveries(&self) -> usize {
+        self.non_fifo_deliveries
+    }
+
+    /// Heals any active partition, then drives `tick_all` + `deliver_all`
+    /// rounds until the cluster is quiescent: two consecutive full rounds in
+    /// a row produce no growth in any node's applied log (and, trivially,
+    /// leave no in-flight messages, since `deliver_all` always drains the
+    /// queue to empty before a round is considered complete). Bounded at
+    /// `MAX_ROUNDS` — failing to quiesce by then is itself a bug (a
+    /// liveness failure, or a fault left active that prevents convergence)
+    /// and panics rather than silently returning early, since every caller
+    /// relies on "settled" meaning something.
+    ///
+    /// Leader completeness can't be checked the instant a new leader is
+    /// elected — a freshly elected leader hasn't caught up to the prior
+    /// committed history yet. `settle()` is what makes checking it
+    /// meaningful: only once the cluster has stopped changing does "the
+    /// leader's applied log" mean anything stable to compare against the
+    /// canonical committed history.
+    fn settle(&mut self) {
+        const MAX_ROUNDS: usize = 200;
+        const STABLE_ROUNDS_REQUIRED: usize = 2;
+
+        self.heal();
+
+        let mut stable_rounds = 0;
+        for _ in 0..MAX_ROUNDS {
+            let before: Vec<usize> = self.applied.iter().map(Vec::len).collect();
+            self.tick_all();
+            self.deliver_all();
+            let after: Vec<usize> = self.applied.iter().map(Vec::len).collect();
+
+            if after == before && self.inflight.is_empty() {
+                stable_rounds += 1;
+                if stable_rounds >= STABLE_ROUNDS_REQUIRED {
+                    return;
+                }
+            } else {
+                stable_rounds = 0;
+            }
+        }
+        panic!(
+            "cluster failed to settle within {MAX_ROUNDS} rounds — applied logs (or in-flight \
+             messages) kept changing; the cluster never reached quiescence"
+        );
+    }
+
     // --- Safety invariants (checked after every scenario) ---
 
     fn assert_invariants(&self) {
         self.assert_election_safety();
         self.assert_log_agreement();
-        self.assert_leader_completeness();
+        self.assert_leader_completeness_pairwise();
+    }
+
+    /// Settles the cluster (see `settle`'s doc comment for why this has to
+    /// happen first), then checks every invariant `assert_invariants` does
+    /// PLUS the strengthened leader-completeness containment check, which is
+    /// only meaningful once the cluster is quiescent and there's exactly one
+    /// current leader to check containment against.
+    fn assert_invariants_after_settle(&mut self) {
+        self.settle();
+        self.assert_invariants();
+        self.assert_leader_completeness_containment();
     }
 
     /// Invariant 1 — ELECTION SAFETY: at most one leader per term. Checked
@@ -427,16 +528,23 @@ impl Cluster {
         }
     }
 
-    /// Invariant 4 — LEADER COMPLETENESS, approximated on the same
-    /// applied-log projection (see `assert_log_agreement`'s doc comment for
-    /// why the projection is used at all): every entry present in a
-    /// leader's applied log at the moment it was observed leading must
-    /// agree, at every overlapping index, with every other such snapshot —
-    /// including ones taken for leaders that led in earlier OR later terms.
-    /// A violation here means some leader's applied log lost or rewrote an
-    /// entry a (possibly earlier) leader had already committed, which is
-    /// exactly what leader completeness forbids.
-    fn assert_leader_completeness(&self) {
+    /// Invariant 4 — LEADER COMPLETENESS, pairwise REWRITE check: every
+    /// entry present in a leader's applied log at the moment it was observed
+    /// leading must agree, at every overlapping index, with every other such
+    /// snapshot — including ones taken for leaders that led in earlier OR
+    /// later terms.
+    ///
+    /// This is necessary but NOT sufficient on its own: comparing only over
+    /// `0..min(a.len, b.len)` means it catches a leader that REWRITES an
+    /// entry at an index it still has, but stays silent if a LATER leader's
+    /// applied log is simply SHORTER — i.e. missing a committed entry
+    /// entirely, never reaching the index where the disagreement would show
+    /// up. That's exactly a leader-completeness violation (a new leader that
+    /// lost prior-committed state), and it's why this is paired with
+    /// `assert_leader_completeness_containment`, which checks containment
+    /// against the full canonical committed history instead of pairwise
+    /// snapshot overlap.
+    fn assert_leader_completeness_pairwise(&self) {
         for i in 0..self.leader_snapshots.len() {
             for j in (i + 1)..self.leader_snapshots.len() {
                 let a = &self.leader_snapshots[i];
@@ -457,6 +565,71 @@ impl Cluster {
             }
         }
     }
+
+    /// Invariant 4 — LEADER COMPLETENESS, the real CONTAINMENT check: after
+    /// the cluster has `settle()`d to exactly one current leader, that
+    /// leader's applied log must CONTAIN every entry ever committed over the
+    /// whole run (`committed_by_index`, built in `record_committed`), at the
+    /// correct index, byte-identical. Unlike
+    /// `assert_leader_completeness_pairwise`, this cannot be fooled by a
+    /// leader whose applied log is simply too SHORT: every committed index
+    /// is checked explicitly, so a missing index is a `None` from
+    /// `leader_applied.get(pos)` rather than a loop bound that silently
+    /// never reaches it.
+    ///
+    /// Requires exactly one current leader — meaningless (and asserted
+    /// against) otherwise, since "the leader" wouldn't be well defined.
+    fn assert_leader_completeness_containment(&self) {
+        let leaders = self.current_leaders();
+        assert_eq!(
+            leaders.len(),
+            1,
+            "assert_leader_completeness_containment requires the cluster to have settled to \
+             exactly one current leader; found {}: {leaders:?}",
+            leaders.len()
+        );
+        let leader = leaders[0];
+        if let Err(violation) = check_containment(&self.committed_by_index, self.applied_of(leader))
+        {
+            panic!("LEADER COMPLETENESS VIOLATED for leader {leader}: {violation}");
+        }
+    }
+}
+
+/// Pure containment check, factored out of `Cluster` so it can be unit
+/// tested directly against synthetic and real fixtures (see
+/// `containment_check_detects_a_lost_committed_entry` and
+/// `containment_check_is_discriminating_on_real_scenario_data` below),
+/// proving the containment invariant is actually discriminating and not
+/// vacuous.
+///
+/// Does `leader_applied` contain every entry in `committed`, at the index
+/// `entry.index` implies (1-based, so `applied[index - 1]`), byte-identical?
+/// Returns `Err` describing the first violation found, `Ok(())` if none.
+fn check_containment(
+    committed: &BTreeMap<LogIndex, LogEntry>,
+    leader_applied: &[LogEntry],
+) -> Result<(), String> {
+    for (&index, entry) in committed {
+        let pos = (index - 1) as usize;
+        match leader_applied.get(pos) {
+            Some(actual) if actual == entry => {}
+            Some(actual) => {
+                return Err(format!(
+                    "leader log MISMATCHES committed index {index}: expected {entry:?}, found \
+                     {actual:?}"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "leader log is MISSING committed index {index} ({entry:?}); leader's \
+                     applied log has only {} entries",
+                    leader_applied.len()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Runs rounds until exactly one node among `subset` is observed leading,
@@ -528,7 +701,7 @@ fn clean_election_and_replication() {
         );
     }
 
-    cluster.assert_invariants();
+    cluster.assert_invariants_after_settle();
 }
 
 #[test]
@@ -564,7 +737,7 @@ fn leader_crash_reelection() {
         );
     }
 
-    cluster.assert_invariants();
+    cluster.assert_invariants_after_settle();
 }
 
 #[test]
@@ -601,7 +774,7 @@ fn partition_and_heal() {
         );
     }
 
-    cluster.assert_invariants();
+    cluster.assert_invariants_after_settle();
 }
 
 #[test]
@@ -634,7 +807,7 @@ fn dropped_appends_backup() {
         cluster.applied_of(other).len(),
         "the blocked follower must converge via conflict back-up once appends are allowed again"
     );
-    cluster.assert_invariants();
+    cluster.assert_invariants_after_settle();
 }
 
 #[test]
@@ -660,8 +833,15 @@ fn reordered_delivery() {
             "node {id} must make progress despite reordered message delivery"
         );
     }
+    assert!(
+        cluster.non_fifo_deliveries() > 0,
+        "reordered_delivery must actually exercise a non-FIFO delivery at least once — a \
+         3-node cluster's leader fans AppendEntries out to 2 followers per round, so multiple \
+         messages should genuinely be in flight at once; if this fails, the queue never had \
+         more than one candidate and the scenario isn't testing what it claims to"
+    );
 
-    cluster.assert_invariants();
+    cluster.assert_invariants_after_settle();
 }
 
 #[test]
@@ -708,7 +888,7 @@ fn restart_persistence() {
         "restarted node must continue replicating new commands"
     );
 
-    cluster.assert_invariants();
+    cluster.assert_invariants_after_settle();
 }
 
 #[test]
@@ -721,7 +901,7 @@ fn determinism() {
             cluster.run(20);
         }
         cluster.run(30);
-        cluster.assert_invariants();
+        cluster.assert_invariants_after_settle();
         let histories = IDS
             .iter()
             .map(|&id| cluster.applied_of(id).to_vec())
@@ -735,5 +915,122 @@ fn determinism() {
         run1, run2,
         "the same seed must produce an identical observable history \
          (same leader, same applied logs) on every run"
+    );
+}
+
+/// Proves `check_containment` — the function behind
+/// `assert_leader_completeness_containment` — is actually discriminating,
+/// on a purely synthetic fixture: a canonical committed history of 3
+/// entries, and a "leader" applied log that has index 1 but is MISSING
+/// index 2 entirely (the log is simply too short to reach it). This is
+/// exactly the bug the review flagged: the old pairwise check only compared
+/// `0..min(a.len, b.len)`, so a later leader with a SHORTER applied log
+/// that dropped a committed entry slipped through undetected. If this test
+/// ever went green on `Ok(())`, the containment check would be vacuous.
+#[test]
+fn containment_check_detects_a_lost_committed_entry() {
+    let mut committed = BTreeMap::new();
+    committed.insert(
+        1,
+        LogEntry {
+            term: 1,
+            index: 1,
+            command: b"a".to_vec(),
+        },
+    );
+    committed.insert(
+        2,
+        LogEntry {
+            term: 1,
+            index: 2,
+            command: b"b".to_vec(),
+        },
+    );
+    committed.insert(
+        3,
+        LogEntry {
+            term: 2,
+            index: 3,
+            command: b"c".to_vec(),
+        },
+    );
+
+    // Leader's applied log has index 1 only — committed index 2 (and 3) are
+    // simply beyond its length, never rewritten, just LOST.
+    let leader_missing_committed_entries = vec![LogEntry {
+        term: 1,
+        index: 1,
+        command: b"a".to_vec(),
+    }];
+
+    let result = check_containment(&committed, &leader_missing_committed_entries);
+    assert!(
+        result.is_err(),
+        "containment check MUST detect a leader whose applied log is missing a committed entry, \
+         got Ok(()) instead: {result:?}"
+    );
+
+    // A leader log that HAS every committed index, correctly, must pass.
+    let leader_with_everything = vec![
+        LogEntry {
+            term: 1,
+            index: 1,
+            command: b"a".to_vec(),
+        },
+        LogEntry {
+            term: 1,
+            index: 2,
+            command: b"b".to_vec(),
+        },
+        LogEntry {
+            term: 2,
+            index: 3,
+            command: b"c".to_vec(),
+        },
+    ];
+    assert!(
+        check_containment(&committed, &leader_with_everything).is_ok(),
+        "containment check must NOT flag a leader log that actually contains everything \
+         committed"
+    );
+}
+
+/// The same proof, but against REAL data from a genuine `Cluster` run rather
+/// than a synthetic fixture: runs a normal scenario to a settled single
+/// leader, confirms the containment check currently passes, then removes
+/// the leader's last applied entry from a COPY of its log and confirms the
+/// same check now fails. This rules out the possibility that
+/// `check_containment` only "works" against hand-built fixtures shaped
+/// exactly to trip it.
+#[test]
+fn containment_check_is_discriminating_on_real_scenario_data() {
+    let mut cluster = Cluster::new(&IDS, 10, 3, 100);
+    elect(&mut cluster, &IDS);
+    for cmd in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()] {
+        propose_on_current_leader(&mut cluster, &IDS, cmd);
+        cluster.run(20);
+    }
+    cluster.settle();
+
+    let leaders = cluster.current_leaders();
+    assert_eq!(
+        leaders.len(),
+        1,
+        "scenario setup must settle to exactly one leader"
+    );
+    let leader = leaders[0];
+
+    check_containment(&cluster.committed_by_index, cluster.applied_of(leader))
+        .expect("a healthy, settled cluster's leader must contain everything committed");
+
+    let mut truncated = cluster.applied_of(leader).to_vec();
+    truncated
+        .pop()
+        .expect("leader must have applied at least one entry for this scenario to be meaningful");
+    let result = check_containment(&cluster.committed_by_index, &truncated);
+    assert!(
+        result.is_err(),
+        "containment check must detect a leader log with a committed entry artificially \
+         removed, got Ok(()) instead: {result:?}"
     );
 }
