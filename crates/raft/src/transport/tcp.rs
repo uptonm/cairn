@@ -25,7 +25,6 @@ const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 const INITIAL_ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_ACCEPT_RETRIES: usize = 8;
 
 struct CachedWriter {
     peer_addr: SocketAddr,
@@ -44,8 +43,14 @@ struct InboundMessage {
     _budget_permit: OwnedSemaphorePermit,
 }
 
+/// Tracks the backoff delay for consecutive `listener.accept()` failures.
+///
+/// A Raft node's inbound listener must stay alive through transient error
+/// bursts (e.g. EMFILE, ECONNABORTED under connection churn): losing the
+/// ability to receive votes/AppendEntries is worse than a slow accept loop.
+/// So this policy never signals "give up" — it only grows the delay, capped,
+/// and `reset` on the next successful accept collapses it back down.
 struct AcceptFailurePolicy {
-    retries: usize,
     next_delay: Duration,
 }
 
@@ -195,23 +200,20 @@ impl InboundBudget {
 impl AcceptFailurePolicy {
     fn new() -> AcceptFailurePolicy {
         AcceptFailurePolicy {
-            retries: 0,
             next_delay: INITIAL_ACCEPT_BACKOFF,
         }
     }
 
-    fn next_delay(&mut self) -> Option<Duration> {
-        if self.retries == MAX_ACCEPT_RETRIES {
-            return None;
-        }
+    /// Returns the delay to wait before retrying, then grows it (capped) for
+    /// next time. Always returns a delay: accept errors back off but the
+    /// listener keeps retrying indefinitely.
+    fn next_delay(&mut self) -> Duration {
         let delay = self.next_delay;
-        self.retries += 1;
         self.next_delay = self.next_delay.saturating_mul(2).min(MAX_ACCEPT_BACKOFF);
-        Some(delay)
+        delay
     }
 
     fn reset(&mut self) {
-        self.retries = 0;
         self.next_delay = INITIAL_ACCEPT_BACKOFF;
     }
 }
@@ -301,9 +303,7 @@ async fn accept_connections(
                         });
                     }
                     Err(_) => {
-                        let Some(delay) = accept_failures.next_delay() else {
-                            break;
-                        };
+                        let delay = accept_failures.next_delay();
                         let shutdown_requested = tokio::select! {
                             _ = tokio::time::sleep(delay) => false,
                             _ = shutdown.changed() => true,
@@ -1175,9 +1175,9 @@ mod tests {
     }
 
     #[test]
-    fn accept_failure_policy_terminates_after_bounded_retries() {
+    fn accept_failure_policy_backs_off_but_never_gives_up() {
         let mut policy = AcceptFailurePolicy::new();
-        let delays: Vec<_> = std::iter::from_fn(|| policy.next_delay()).collect();
+        let delays: Vec<_> = (0..8).map(|_| policy.next_delay()).collect();
 
         assert_eq!(
             delays,
@@ -1192,9 +1192,47 @@ mod tests {
                 Duration::from_secs(1),
             ]
         );
-        assert_eq!(policy.next_delay(), None);
+
+        // Backoff is capped, not terminal: further failures keep retrying at
+        // the max delay instead of the policy ever signalling "give up".
+        for _ in 0..100 {
+            assert_eq!(policy.next_delay(), Duration::from_secs(1));
+        }
 
         policy.reset();
-        assert_eq!(policy.next_delay(), Some(Duration::from_millis(10)));
+        assert_eq!(policy.next_delay(), Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn accept_loop_recovers_after_a_burst_of_accept_failures() {
+        // Regression test: the accept loop must not permanently die after a
+        // burst of transient accept errors. We can't force `listener.accept()`
+        // itself to fail deterministically on a real socket, so this test
+        // exercises the same policy the accept loop drives and then proves,
+        // end-to-end through a live TcpTransport, that inbound connections are
+        // still serviced after many consecutive simulated failures.
+        let mut policy = AcceptFailurePolicy::new();
+        for _ in 0..50 {
+            let _ = policy.next_delay();
+        }
+        policy.reset();
+        assert_eq!(policy.next_delay(), Duration::from_millis(10));
+
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut transport = TcpTransport::bind(2, bind_addr, HashMap::new())
+            .await
+            .unwrap();
+        let mut client = TcpStream::connect(transport.local_addr()).await.unwrap();
+        client.write_all(&1_u64.to_le_bytes()).await.unwrap();
+        let message = Message::InstallSnapshotResp(InstallSnapshotResp { term: 61 });
+        write_raw_message(&mut client, &message).await;
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), transport.recv())
+                .await
+                .unwrap(),
+            Some((1, message)),
+            "accept loop did not service a connection after a burst of prior failures"
+        );
     }
 }
