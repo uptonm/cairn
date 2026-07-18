@@ -1,5 +1,6 @@
 pub mod error;
 pub mod hardstate;
+pub mod lincheck;
 pub mod log;
 pub mod oplog;
 pub mod types;
