@@ -56,13 +56,23 @@ fn encode(op: &Op) -> Vec<u8> {
 }
 
 pub fn read_all(path: &Path) -> Result<Vec<Op>> {
+    let (ops, _len) = read_all_with_len(path)?;
+    Ok(ops)
+}
+
+/// Replays every valid record in the op-log at `path`, returning the ops
+/// together with the byte offset just past the last valid record. Any bytes
+/// beyond that offset are a torn or corrupt tail and were not included.
+/// Returns `(Vec::new(), 0)` if the file does not exist.
+pub fn read_all_with_len(path: &Path) -> Result<(Vec<Op>, u64)> {
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(Error::Io(e)),
     };
     let mut r = BufReader::new(file);
     let mut out = Vec::new();
+    let mut valid_len: u64 = 0;
     loop {
         let mut crc_buf = [0u8; 4];
         match r.read_exact(&mut crc_buf) {
@@ -73,13 +83,16 @@ pub fn read_all(path: &Path) -> Result<Vec<Op>> {
         let expected_crc = u32::from_le_bytes(crc_buf);
         match read_body(&mut r)? {
             Some(body) if crc32fast::hash(&body) == expected_crc => match decode(&body) {
-                Some(op) => out.push(op),
+                Some(op) => {
+                    valid_len += 4 + body.len() as u64;
+                    out.push(op);
+                }
                 None => break,
             },
             _ => break,
         }
     }
-    Ok(out)
+    Ok((out, valid_len))
 }
 
 fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<bool> {

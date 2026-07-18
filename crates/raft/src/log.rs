@@ -1,6 +1,7 @@
-use crate::error::Result;
-use crate::oplog::{read_all, Op, OpWriter};
+use crate::error::{Error, Result};
+use crate::oplog::{read_all_with_len, Op, OpWriter};
 use crate::types::{LogEntry, LogIndex, SnapshotMeta, Term};
+use std::fs::OpenOptions;
 use std::path::Path;
 
 pub struct RaftLog {
@@ -15,8 +16,21 @@ impl RaftLog {
         let path = dir.join("log.ops");
         let mut entries: Vec<LogEntry> = Vec::new();
         let mut snapshot = SnapshotMeta::default();
-        for op in read_all(&path)? {
+        let (ops, valid_len) = read_all_with_len(&path)?;
+        for op in ops {
             apply_op(&mut entries, &mut snapshot, op);
+        }
+        // A crash can leave a torn/corrupt record past the valid prefix.
+        // Truncate it away before opening the writer in append mode, or a
+        // later append would land after the garbage and be lost again the
+        // next time the file is replayed.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > valid_len {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)?
+                    .set_len(valid_len)?;
+            }
         }
         let writer = OpWriter::create(&path)?;
         Ok(RaftLog {
@@ -27,12 +41,15 @@ impl RaftLog {
     }
 
     pub fn append(&mut self, new_entries: &[LogEntry]) -> Result<()> {
+        for (expected, entry) in (self.last_index() + 1..).zip(new_entries.iter()) {
+            if entry.index != expected {
+                return Err(Error::Corruption(format!(
+                    "log append must be contiguous: expected index {expected}, got {}",
+                    entry.index
+                )));
+            }
+        }
         for entry in new_entries {
-            debug_assert_eq!(
-                entry.index,
-                self.last_index() + 1,
-                "log append must be contiguous"
-            );
             self.writer.append(&Op::Append(entry.clone()))?;
             self.entries.push(entry.clone());
         }
@@ -84,10 +101,18 @@ impl RaftLog {
     }
 
     pub fn compact_prefix(&mut self, up_to: LogIndex, meta: SnapshotMeta) -> Result<()> {
-        debug_assert!(
-            up_to <= self.last_index(),
-            "cannot compact past the log end"
-        );
+        if up_to > self.last_index() {
+            return Err(Error::Corruption(format!(
+                "cannot compact past the log end: up_to {up_to} > last_index {}",
+                self.last_index()
+            )));
+        }
+        if meta.last_index != up_to {
+            return Err(Error::Corruption(format!(
+                "compact snapshot meta.last_index {} must equal up_to {up_to}",
+                meta.last_index
+            )));
+        }
         self.writer.append(&Op::Compact { up_to, meta })?;
         self.entries.retain(|e| e.index > up_to);
         self.snapshot = meta;
@@ -231,6 +256,98 @@ mod tests {
             SnapshotMeta {
                 last_index: 1,
                 last_term: 1
+            }
+        );
+    }
+
+    #[test]
+    fn torn_tail_is_truncated_so_later_appends_survive() {
+        use std::io::Write;
+
+        let dir = tempdir().unwrap();
+        {
+            let mut log = RaftLog::open(dir.path()).unwrap();
+            log.append(&[e(1, 1), e(1, 2)]).unwrap();
+        }
+
+        // Simulate a crash mid-write: a valid record has begun (or partially
+        // written) but never completed, leaving a torn tail on disk.
+        let ops_path = dir.path().join("log.ops");
+        let mut f = OpenOptions::new().append(true).open(&ops_path).unwrap();
+        f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03])
+            .unwrap();
+        drop(f);
+
+        {
+            // Reopening must truncate the garbage tail away.
+            let mut log = RaftLog::open(dir.path()).unwrap();
+            assert_eq!(log.last_index(), 2);
+            log.append(&[e(1, 3)]).unwrap();
+        }
+
+        let log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(log.entry(3), Some(&e(1, 3)));
+    }
+
+    #[test]
+    fn append_rejects_noncontiguous_index() {
+        let dir = tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[e(1, 1), e(1, 2)]).unwrap();
+
+        let result = log.append(&[e(1, 4)]);
+        assert!(matches!(result, Err(Error::Corruption(_))));
+
+        // No partial mutation from the rejected append.
+        assert_eq!(log.last_index(), 2);
+        assert_eq!(log.entry(4), None);
+    }
+
+    #[test]
+    fn compact_rejects_up_to_past_end() {
+        let dir = tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[e(1, 1), e(1, 2)]).unwrap();
+
+        let result = log.compact_prefix(
+            5,
+            SnapshotMeta {
+                last_index: 5,
+                last_term: 1,
+            },
+        );
+        assert!(matches!(result, Err(Error::Corruption(_))));
+        assert_eq!(log.last_index(), 2);
+        assert_eq!(
+            log.snapshot_meta(),
+            SnapshotMeta {
+                last_index: 0,
+                last_term: 0
+            }
+        );
+    }
+
+    #[test]
+    fn compact_rejects_meta_mismatch() {
+        let dir = tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[e(1, 1), e(1, 2), e(1, 3)]).unwrap();
+
+        let result = log.compact_prefix(
+            2,
+            SnapshotMeta {
+                last_index: 3,
+                last_term: 1,
+            },
+        );
+        assert!(matches!(result, Err(Error::Corruption(_))));
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(
+            log.snapshot_meta(),
+            SnapshotMeta {
+                last_index: 0,
+                last_term: 0
             }
         );
     }
