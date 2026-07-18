@@ -2,20 +2,24 @@ use super::Transport;
 use crate::{Message, NodeId};
 use bincode::Options;
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 const INBOUND_CHANNEL_CAPACITY: usize = 256;
 const MAX_INBOUND_CONNECTIONS: usize = 32;
+const INBOUND_BYTE_BUDGET: usize = 16 * 1024 * 1024;
+const INBOUND_READ_CHUNK_SIZE: usize = 64 * 1024;
+const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 const INITIAL_ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_ACCEPT_RETRIES: usize = 8;
 
 struct CachedWriter {
     peer_addr: SocketAddr,
@@ -27,6 +31,30 @@ struct EncodedFrame {
     payload: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct InboundBudget {
+    semaphore: Arc<Semaphore>,
+    capacity: usize,
+}
+
+struct InboundMessage {
+    source_id: NodeId,
+    message: Message,
+    _budget_permit: OwnedSemaphorePermit,
+}
+
+struct AcceptFailurePolicy {
+    retries: usize,
+    next_delay: Duration,
+}
+
+struct ChunkReader<'a> {
+    chunks: &'a [Vec<u8>],
+    chunk_index: usize,
+    chunk_offset: usize,
+    remaining: usize,
+}
+
 type WriterSlot = Arc<Mutex<Option<CachedWriter>>>;
 
 pub struct TcpTransport {
@@ -34,9 +62,11 @@ pub struct TcpTransport {
     local_addr: SocketAddr,
     peers: RwLock<HashMap<NodeId, SocketAddr>>,
     writers: Mutex<HashMap<NodeId, WriterSlot>>,
-    receiver: mpsc::Receiver<(NodeId, Message)>,
+    receiver: mpsc::Receiver<InboundMessage>,
     shutdown: watch::Sender<bool>,
     _accept_task: JoinHandle<()>,
+    #[cfg(test)]
+    inbound_budget: InboundBudget,
 }
 
 impl TcpTransport {
@@ -49,7 +79,13 @@ impl TcpTransport {
         let local_addr = listener.local_addr()?;
         let (sender, receiver) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
         let (shutdown, shutdown_receiver) = watch::channel(false);
-        let accept_task = tokio::spawn(accept_connections(listener, sender, shutdown_receiver));
+        let inbound_budget = InboundBudget::new(INBOUND_BYTE_BUDGET);
+        let accept_task = tokio::spawn(accept_connections(
+            listener,
+            sender,
+            shutdown_receiver,
+            inbound_budget.clone(),
+        ));
 
         Ok(TcpTransport {
             node_id,
@@ -59,6 +95,8 @@ impl TcpTransport {
             receiver,
             shutdown,
             _accept_task: accept_task,
+            #[cfg(test)]
+            inbound_budget,
         })
     }
 
@@ -121,7 +159,102 @@ impl Transport for TcpTransport {
     }
 
     async fn recv(&mut self) -> Option<(NodeId, Message)> {
-        self.receiver.recv().await
+        let inbound = self.receiver.recv().await?;
+        let InboundMessage {
+            source_id,
+            message,
+            _budget_permit,
+        } = inbound;
+        drop(_budget_permit);
+        Some((source_id, message))
+    }
+}
+
+impl InboundBudget {
+    fn new(capacity: usize) -> InboundBudget {
+        InboundBudget {
+            semaphore: Arc::new(Semaphore::new(capacity)),
+            capacity,
+        }
+    }
+
+    async fn acquire(&self, payload_len: usize) -> crate::Result<OwnedSemaphorePermit> {
+        let permit_count = payload_len.min(self.capacity);
+        let permit_count = u32::try_from(permit_count).map_err(|_| {
+            io_error(
+                ErrorKind::InvalidInput,
+                "inbound byte budget exceeds semaphore permit range",
+            )
+        })?;
+        Arc::clone(&self.semaphore)
+            .acquire_many_owned(permit_count)
+            .await
+            .map_err(|_| io_error(ErrorKind::BrokenPipe, "inbound byte budget is unavailable"))
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+}
+
+impl AcceptFailurePolicy {
+    fn new() -> AcceptFailurePolicy {
+        AcceptFailurePolicy {
+            retries: 0,
+            next_delay: INITIAL_ACCEPT_BACKOFF,
+        }
+    }
+
+    fn next_delay(&mut self) -> Option<Duration> {
+        if self.retries == MAX_ACCEPT_RETRIES {
+            return None;
+        }
+        let delay = self.next_delay;
+        self.retries += 1;
+        self.next_delay = self.next_delay.saturating_mul(2).min(MAX_ACCEPT_BACKOFF);
+        Some(delay)
+    }
+
+    fn reset(&mut self) {
+        self.retries = 0;
+        self.next_delay = INITIAL_ACCEPT_BACKOFF;
+    }
+}
+
+impl<'a> ChunkReader<'a> {
+    fn new(chunks: &'a [Vec<u8>], payload_len: usize) -> ChunkReader<'a> {
+        ChunkReader {
+            chunks,
+            chunk_index: 0,
+            chunk_offset: 0,
+            remaining: payload_len,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+}
+
+impl Read for ChunkReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        while written < buffer.len() && self.chunk_index < self.chunks.len() {
+            let chunk = &self.chunks[self.chunk_index];
+            let available = &chunk[self.chunk_offset..];
+            if available.is_empty() {
+                self.chunk_index += 1;
+                self.chunk_offset = 0;
+                continue;
+            }
+            let copy_len = available.len().min(buffer.len() - written);
+            buffer[written..written + copy_len].copy_from_slice(&available[..copy_len]);
+            written += copy_len;
+            self.chunk_offset += copy_len;
+            self.remaining -= copy_len;
+        }
+        Ok(written)
     }
 }
 
@@ -171,11 +304,12 @@ async fn connect_writer(node_id: NodeId, peer_addr: SocketAddr) -> crate::Result
 
 async fn accept_connections(
     listener: TcpListener,
-    sender: mpsc::Sender<(NodeId, Message)>,
+    sender: mpsc::Sender<InboundMessage>,
     mut shutdown: watch::Receiver<bool>,
+    inbound_budget: InboundBudget,
 ) {
     let mut readers = JoinSet::new();
-    let mut accept_backoff = INITIAL_ACCEPT_BACKOFF;
+    let mut accept_failures = AcceptFailurePolicy::new();
 
     loop {
         tokio::select! {
@@ -185,14 +319,17 @@ async fn accept_connections(
             accepted = listener.accept(), if readers.len() < MAX_INBOUND_CONNECTIONS => {
                 match accepted {
                     Ok((stream, _)) => {
-                        accept_backoff = INITIAL_ACCEPT_BACKOFF;
+                        accept_failures.reset();
                         let sender = sender.clone();
-                        readers.spawn(async move { read_stream(stream, sender).await });
+                        let inbound_budget = inbound_budget.clone();
+                        readers.spawn(async move {
+                            read_stream(stream, sender, inbound_budget).await
+                        });
                     }
                     Err(_) => {
-                        let delay = accept_backoff;
-                        accept_backoff =
-                            accept_backoff.saturating_mul(2).min(MAX_ACCEPT_BACKOFF);
+                        let Some(delay) = accept_failures.next_delay() else {
+                            break;
+                        };
                         let shutdown_requested = tokio::select! {
                             _ = tokio::time::sleep(delay) => false,
                             _ = shutdown.changed() => true,
@@ -212,32 +349,110 @@ async fn accept_connections(
 
 async fn read_stream(
     mut stream: TcpStream,
-    sender: mpsc::Sender<(NodeId, Message)>,
+    sender: mpsc::Sender<InboundMessage>,
+    inbound_budget: InboundBudget,
 ) -> crate::Result<()> {
     let mut handshake = [0; 8];
-    stream.read_exact(&mut handshake).await?;
+    read_exact_with_idle_timeout(&mut stream, &mut handshake).await?;
     let source_id = NodeId::from_le_bytes(handshake);
 
     loop {
         let mut length = [0; 4];
-        stream.read_exact(&mut length).await?;
+        read_exact_with_idle_timeout(&mut stream, &mut length).await?;
         let payload_len = u32::from_le_bytes(length) as usize;
-        let mut payload = vec![0; payload_len];
-        stream.read_exact(&mut payload).await?;
-        let message = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .reject_trailing_bytes()
-            .deserialize(&payload)
-            .map_err(|error| {
-                crate::Error::Corruption(format!("message deserialization failed: {error}"))
+        let budget_permit = inbound_budget.acquire(payload_len).await?;
+        let payload = read_payload(&mut stream, payload_len).await?;
+        let message = {
+            let mut payload_reader = ChunkReader::new(&payload, payload_len);
+            let message = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .reject_trailing_bytes()
+                .with_limit(payload_len as u64)
+                .deserialize_from(&mut payload_reader)
+                .map_err(|error| {
+                    crate::Error::Corruption(format!("message deserialization failed: {error}"))
+                })?;
+            if payload_reader.remaining() != 0 {
+                return Err(crate::Error::Corruption(
+                    "message deserialization left trailing payload bytes".to_string(),
+                ));
+            }
+            message
+        };
+        drop(payload);
+        sender
+            .send(InboundMessage {
+                source_id,
+                message,
+                _budget_permit: budget_permit,
+            })
+            .await
+            .map_err(|_| {
+                io_error(
+                    ErrorKind::BrokenPipe,
+                    "TCP transport inbound receiver is closed",
+                )
             })?;
-        sender.send((source_id, message)).await.map_err(|_| {
-            io_error(
-                ErrorKind::BrokenPipe,
-                "TCP transport inbound receiver is closed",
-            )
-        })?;
     }
+}
+
+async fn read_payload(stream: &mut TcpStream, payload_len: usize) -> crate::Result<Vec<Vec<u8>>> {
+    let chunk_count = payload_len / INBOUND_READ_CHUNK_SIZE
+        + usize::from(!payload_len.is_multiple_of(INBOUND_READ_CHUNK_SIZE));
+    let mut chunks = Vec::new();
+    chunks.try_reserve_exact(chunk_count).map_err(|error| {
+        io_error(
+            ErrorKind::OutOfMemory,
+            format!("cannot allocate incoming frame chunk index: {error}"),
+        )
+    })?;
+
+    let mut remaining = payload_len;
+    while remaining != 0 {
+        let chunk_len = remaining.min(INBOUND_READ_CHUNK_SIZE);
+        let mut chunk = allocate_zeroed_chunk(chunk_len)?;
+        read_exact_with_idle_timeout(stream, &mut chunk).await?;
+        chunks.push(chunk);
+        remaining -= chunk_len;
+    }
+    Ok(chunks)
+}
+
+fn allocate_zeroed_chunk(chunk_len: usize) -> crate::Result<Vec<u8>> {
+    let mut chunk = Vec::new();
+    chunk.try_reserve_exact(chunk_len).map_err(|error| {
+        io_error(
+            ErrorKind::OutOfMemory,
+            format!("cannot allocate incoming frame chunk: {error}"),
+        )
+    })?;
+    chunk.resize(chunk_len, 0);
+    Ok(chunk)
+}
+
+async fn read_exact_with_idle_timeout(
+    stream: &mut TcpStream,
+    mut buffer: &mut [u8],
+) -> crate::Result<()> {
+    while !buffer.is_empty() {
+        let bytes_read = tokio::time::timeout(INBOUND_IDLE_TIMEOUT, stream.read(buffer))
+            .await
+            .map_err(|_| {
+                io_error(
+                    ErrorKind::TimedOut,
+                    "TCP inbound read made no progress before idle deadline",
+                )
+            })??;
+        if bytes_read == 0 {
+            return Err(io_error(
+                ErrorKind::UnexpectedEof,
+                "TCP inbound stream ended before the frame completed",
+            ));
+        }
+        let (_, remaining) = buffer.split_at_mut(bytes_read);
+        buffer = remaining;
+    }
+    Ok(())
 }
 
 fn io_error(kind: ErrorKind, message: impl Into<String>) -> crate::Error {
@@ -246,7 +461,10 @@ fn io_error(kind: ErrorKind, message: impl Into<String>) -> crate::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::TcpTransport;
+    use super::{
+        allocate_zeroed_chunk, AcceptFailurePolicy, InboundBudget, TcpTransport,
+        INBOUND_BYTE_BUDGET,
+    };
     use crate::transport::Transport;
     use crate::{
         AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, LogEntry,
@@ -716,5 +934,142 @@ mod tests {
             .unwrap();
         assert!(received.insert(final_source));
         assert_eq!(received.len(), EXPECTED_MAX_CONNECTIONS + 1);
+    }
+
+    #[tokio::test]
+    async fn idle_partial_handshakes_release_reader_slots() {
+        const EXPECTED_MAX_CONNECTIONS: usize = 32;
+
+        let mut transport =
+            TcpTransport::bind(2, SocketAddr::from(([127, 0, 0, 1], 0)), HashMap::new())
+                .await
+                .unwrap();
+        let mut idle_clients = Vec::new();
+        for _ in 0..EXPECTED_MAX_CONNECTIONS {
+            let mut client = TcpStream::connect(transport.local_addr()).await.unwrap();
+            client.write_all(&[0x01]).await.unwrap();
+            idle_clients.push(client);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut valid = TcpStream::connect(transport.local_addr()).await.unwrap();
+        valid.write_all(&77_u64.to_le_bytes()).await.unwrap();
+        let expected = Message::InstallSnapshotResp(InstallSnapshotResp { term: 53 });
+        write_raw_message(&mut valid, &expected).await;
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), transport.recv())
+                .await
+                .unwrap(),
+            Some((77, expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn byte_budget_bounds_normal_frames_and_exclusively_admits_oversized() {
+        let budget = InboundBudget::new(10);
+        let first = budget.acquire(6).await.unwrap();
+        let waiting_budget = budget.clone();
+        let mut second = tokio::spawn(async move { waiting_budget.acquire(5).await.unwrap() });
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut second)
+            .await
+            .is_err());
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let oversized_budget = budget.clone();
+        let mut oversized =
+            tokio::spawn(async move { oversized_budget.acquire(11).await.unwrap() });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut oversized)
+                .await
+                .is_err()
+        );
+        drop(second);
+        let oversized = tokio::time::timeout(Duration::from_secs(1), oversized)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let normal_budget = budget.clone();
+        let mut normal = tokio::spawn(async move { normal_budget.acquire(1).await.unwrap() });
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut normal)
+            .await
+            .is_err());
+        drop(oversized);
+        let _ = tokio::time::timeout(Duration::from_secs(1), normal)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_message_holds_budget_until_recv() {
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut receiver = TcpTransport::bind(2, bind_addr, HashMap::new())
+            .await
+            .unwrap();
+        let sender = TcpTransport::bind(1, bind_addr, HashMap::from([(2, receiver.local_addr())]))
+            .await
+            .unwrap();
+        let expected = Message::InstallSnapshot(InstallSnapshotReq {
+            term: 59,
+            leader_id: 1,
+            last_index: 113,
+            last_term: 58,
+            data: vec![0x2a; 4096],
+        });
+        let encoded_len = bincode::serialize(&expected).unwrap().len();
+
+        sender.send(2, expected.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if receiver.inbound_budget.available_permits() == INBOUND_BYTE_BUDGET - encoded_len
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(receiver.recv().await, Some((1, expected)));
+        assert_eq!(
+            receiver.inbound_budget.available_permits(),
+            INBOUND_BYTE_BUDGET
+        );
+    }
+
+    #[test]
+    fn payload_chunk_allocation_failure_is_recoverable() {
+        assert!(allocate_zeroed_chunk(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn accept_failure_policy_terminates_after_bounded_retries() {
+        let mut policy = AcceptFailurePolicy::new();
+        let delays: Vec<_> = std::iter::from_fn(|| policy.next_delay()).collect();
+
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+                Duration::from_millis(80),
+                Duration::from_millis(160),
+                Duration::from_millis(320),
+                Duration::from_millis(640),
+                Duration::from_secs(1),
+            ]
+        );
+        assert_eq!(policy.next_delay(), None);
+
+        policy.reset();
+        assert_eq!(policy.next_delay(), Some(Duration::from_millis(10)));
     }
 }
