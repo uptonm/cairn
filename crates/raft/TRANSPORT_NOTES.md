@@ -75,10 +75,12 @@ Each following message is a four-byte little-endian `u32` payload length followe
 bincode-serialized `Message`. The inbound reader pairs the connection's handshake ID
 with every decoded frame for `recv`.
 
-Outbound writers are opened on first send and cached per peer address. A failed write
-evicts the writer and the same `send` makes one fresh connection/write attempt; a failed
-second attempt is returned as an I/O error. Updating a peer address makes the cached
-writer ineligible for reuse.
+Outbound writers are opened lazily and cached per peer address. Each `send` makes up to
+two delivery attempts; the first uses an eligible cached writer or establishes a fresh
+connection. Any first-attempt failure while connecting, writing the sender handshake,
+or writing the frame leaves no cached writer and triggers one fresh
+connect/handshake/frame attempt. Only a second-attempt failure is returned as an I/O
+error. Updating a peer address makes the cached writer ineligible for reuse.
 
 Inbound work has at most 32 reader tasks and a 256-message channel. Frames at or below
 16 MiB reserve their encoded payload size from a shared 16 MiB byte budget, held until
@@ -93,12 +95,13 @@ that reader. Listener accept failures retry with exponential backoff (10 ms thro
 
 ## Errors and Contract Deviations
 
-Listener bind failures are returned by `bind`; unknown peers and outbound connect or
-frame-write failures are returned by `send`, all as the crate's existing I/O error.
-Serialization and malformed-frame failures use the existing corruption error. Inbound
-connection read failures close only that reader. Accept-retry exhaustion terminates the
-listener, aborts its readers, and closes inbound delivery; it is not returned as an I/O
-error.
+Listener bind failures are returned by `bind`; unknown peers are returned immediately
+by `send`. Outbound connect, sender-handshake write, and frame-write failures are
+returned by `send` as the crate's existing I/O error only if the second attempt also
+fails. Serialization and malformed-frame failures use the existing corruption error.
+Inbound connection read failures close only that reader. Accept-retry exhaustion
+terminates the listener, aborts its readers, and closes inbound delivery; it is not
+returned as an I/O error.
 
 The sender-ID handshake is protocol metadata required to implement
 `Transport::recv(&mut self) -> Option<(NodeId, Message)>`, because `Message` has no
