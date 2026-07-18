@@ -1,6 +1,7 @@
 use crate::{Message, NodeId};
 
 pub mod in_memory;
+pub mod tcp;
 
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {

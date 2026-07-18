@@ -12,4 +12,5 @@ pub use rpc::{
     AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, Message,
     RequestVoteReq, RequestVoteResp,
 };
+pub use transport::tcp::TcpTransport;
 pub use types::{HardState, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
