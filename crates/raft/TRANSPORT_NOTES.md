@@ -1,27 +1,28 @@
 # Raft Transport Notes
 
-## Architecture
+## Final Architecture
 
 The transport layer exposes the frozen `Transport` trait over two implementations:
 
 - `InMemoryTransport` is one endpoint in a deterministic, in-process network.
-  `InMemoryTransport::cluster` creates every endpoint together and returns a separate
+  `InMemoryTransport::cluster` creates every endpoint together and returns a separate,
   cloneable `InMemoryNetwork` fault-control handle.
 - `TcpTransport` binds one Tokio TCP listener per node. Outbound connections are
   opened lazily, cached, and replaced after a failed write.
 
 The in-memory control plane is separate from endpoint ownership so a test harness can
 move every endpoint into a node task while retaining one handle for fault injection.
-Messages are assigned stable sequence numbers, and equal-deadline deliveries use those
-numbers for deterministic FIFO tie-breaking. The constructor seed initializes this
-scheduling state and is retained as the extension point for later seeded chaos policies.
+Messages admitted to the scheduler receive sequence numbers starting at the supplied
+`seed`; equal-deadline deliveries are ordered by that sequence number (FIFO). The
+constructor must run with an active Tokio runtime because it spawns the scheduler; it
+returns an I/O error otherwise.
 
 TCP connections start with an eight-byte little-endian sender node ID. Every subsequent
 frame on that connection is exactly a four-byte little-endian payload length followed
 by one bincode-serialized `Message`. The receiver combines the handshake identity with
 each decoded message to produce `(from_node, message)`.
 
-## Planned Public API
+## Final Public API
 
 ```rust
 pub fn InMemoryTransport::cluster(
@@ -40,41 +41,70 @@ pub fn InMemoryNetwork::set_delay(
 ) -> crate::Result<()>;
 ```
 
-`partition(a, b)` blocks both directions. `drop_next(from, to)` is directional,
-consumes exactly one matching send, and repeated calls stack. `set_delay(from, to,
-Duration::ZERO)` clears the directional delay. `heal()` clears every partition but
-does not clear delays or pending one-shot drops.
+All in-memory fault hooks validate their node IDs. `partition(a, b)` uses an
+order-independent key, so it blocks both directions (including `a == b`).
+`drop_next(from, to)` and `set_delay(from, to, delay)` are directional.
+Each `drop_next` increments a counter, so repeated calls stack and consume one matching
+send each. `set_delay(from, to, Duration::ZERO)` removes that directional delay.
+`heal()` clears all partitions only; it does not clear delays or pending drops.
 
-Fault rules are evaluated when `send` begins. Changing a rule does not retroactively
-alter a send already admitted by the scheduler.
+Fault rules are evaluated while `send` starts, before the delivery enters the scheduler.
+Changing a rule does not retroactively alter an admitted delivery. Partitioned and
+dropped sends return `Ok(())`; an admitted send completes after its destination channel
+accepts the message. Unknown, closed, or unavailable destinations return an I/O error.
 
-## Error Handling
+## TCP Wire Protocol and Lifecycle
+
+The exact TCP constructors and peer-update APIs are:
+
+```rust
+pub async fn TcpTransport::bind(
+    node_id: NodeId,
+    bind_addr: SocketAddr,
+    peers: HashMap<NodeId, SocketAddr>,
+) -> crate::Result<TcpTransport>;
+
+pub fn TcpTransport::local_addr(&self) -> SocketAddr;
+
+pub async fn TcpTransport::set_peer(&self, node_id: NodeId, addr: SocketAddr);
+```
+
+`bind` binds the listener and `local_addr` returns its resolved address. The first write
+on every outbound connection is an eight-byte little-endian sender `NodeId` handshake.
+Each following message is a four-byte little-endian `u32` payload length followed by the
+bincode-serialized `Message`. The inbound reader pairs the connection's handshake ID
+with every decoded frame for `recv`.
+
+Outbound writers are opened on first send and cached per peer address. A failed write
+evicts the writer and the same `send` makes one fresh connection/write attempt; a failed
+second attempt is returned as an I/O error. Updating a peer address makes the cached
+writer ineligible for reuse.
+
+Inbound work is bounded: at most 32 reader tasks, a 256-message inbound channel, and a
+16 MiB payload-byte budget held until `recv` removes a message. Frames are read in at
+most 64 KiB chunks. Every handshake, length, and payload read must make progress within
+one second; timeout, EOF, malformed bincode, trailing bytes, allocation failure, or
+channel closure closes only that reader. Listener accept failures retry with exponential
+backoff (10 ms through 1 s) at most eight times, then terminate the listener and abort
+active readers. Dropping `TcpTransport` signals listener shutdown and aborts readers.
+
+## Errors and Contract Deviations
 
 Unknown peers, listener and connection failures, and frame writes return the crate's
 existing I/O error. Serialization and malformed-frame failures use the existing
 corruption error. A malformed inbound TCP connection is closed without stopping the
-node listener.
+node listener unless accept failures exhaust the retry budget.
 
-## Test Plan
+The sender-ID handshake is protocol metadata required to implement
+`Transport::recv(&mut self) -> Option<(NodeId, Message)>`, because `Message` has no
+sender field. It is therefore an intentional wire-level addition beyond the frozen
+message values. The trait has no error return from `recv`, so listener termination and
+inbound-channel closure surface as `None`, rather than a listener error. There are no
+other deviations from the frozen user contract.
 
-1. Round-trip every `Message` variant through bincode.
-2. Deliver messages among three in-memory endpoints.
-3. Verify bidirectional partition/heal behavior and one-shot directional drops.
-4. Round-trip every `Message` variant between two OS-assigned loopback sockets.
-5. Run crate tests, workspace build, formatting, and all-target clippy with warnings
-   denied.
+# Historical Raft Transport Implementation Plan
 
-## Deviations
-
-No contract deviations are planned. The sender-ID handshake precedes framed messages
-because `Message` intentionally contains no source node ID while `Transport::recv`
-must return one.
-
-# Raft Transport Implementation Plan
-
-> **For agentic workers:** REQUIRED SUB-SKILL: Use
-> superpowers:subagent-driven-development or superpowers:executing-plans to implement
-> this plan task-by-task. Steps use checkbox syntax for tracking.
+> Completed implementation record. The checklist items below are historical.
 
 **Goal:** Add serializable Raft RPCs and deterministic in-memory and reconnecting TCP
 implementations of the frozen transport trait.
@@ -114,15 +144,15 @@ uses a listener task, per-connection reader tasks, and lazily cached outbound wr
 - Add serde traits to `LogEntry`; type aliases already serialize as `u64`.
 - Export `rpc`, `Message`, and every RPC struct from the crate root.
 
-- [ ] Add an `rpc::tests::all_message_variants_roundtrip_with_bincode` test that builds
+- [x] Add an `rpc::tests::all_message_variants_roundtrip_with_bincode` test that builds
   one value of every enum variant, serializes each with `bincode::serialize`,
   deserializes with `bincode::deserialize::<Message>`, and asserts equality.
-- [ ] Run `cargo test -p cairn-raft rpc::tests` and confirm the missing RPC types or
+- [x] Run `cargo test -p cairn-raft rpc::tests` and confirm the missing RPC types or
   serde implementations make it fail.
-- [ ] Add the requested dependencies, exact frozen derives/fields, `LogEntry` serde
+- [x] Add the requested dependencies, exact frozen derives/fields, `LogEntry` serde
   derives, module declarations, and root re-exports.
-- [ ] Re-run `cargo test -p cairn-raft rpc::tests` and the full crate test suite.
-- [ ] Commit as `feat(raft): add serializable RPC contract`.
+- [x] Re-run `cargo test -p cairn-raft rpc::tests` and the full crate test suite.
+- [x] Commit as `feat(raft): add serializable RPC contract`.
 
 ### Task 2: Transport trait and deterministic in-memory network
 
@@ -157,16 +187,16 @@ pub fn InMemoryNetwork::set_delay(
 ) -> crate::Result<()>;
 ```
 
-- [ ] Add Tokio tests for three-node delivery, partition then heal, and exactly one
+- [x] Add Tokio tests for three-node delivery, partition then heal, and exactly one
   directional dropped message. Use timeouts only to prove non-delivery; compare
   received `(NodeId, Message)` values directly.
-- [ ] Run `cargo test -p cairn-raft transport::in_memory::tests` and confirm it fails
+- [x] Run `cargo test -p cairn-raft transport::in_memory::tests` and confirm it fails
   because the transport module and types do not exist.
-- [ ] Implement a shared scheduler with validated node IDs, symmetric partition keys,
+- [x] Implement a shared scheduler with validated node IDs, symmetric partition keys,
   directional drop counters and delays, stable seeded sequence numbers, and one
   receiver per endpoint. Closed destination receivers return an I/O error.
-- [ ] Re-run focused and full crate tests.
-- [ ] Commit as `feat(raft): add deterministic in-memory transport`.
+- [x] Re-run focused and full crate tests.
+- [x] Commit as `feat(raft): add deterministic in-memory transport`.
 
 ### Task 3: Framed reconnecting TCP transport
 
@@ -190,15 +220,15 @@ pub fn TcpTransport::local_addr(&self) -> SocketAddr;
 pub async fn TcpTransport::set_peer(&self, node_id: NodeId, addr: SocketAddr);
 ```
 
-- [ ] Add a two-node Tokio test that binds both nodes to `127.0.0.1:0`, exchanges every
+- [x] Add a two-node Tokio test that binds both nodes to `127.0.0.1:0`, exchanges every
   `Message` variant in both directions, and asserts sender IDs and payload equality.
-- [ ] Run `cargo test -p cairn-raft transport::tcp::tests` and confirm it fails because
+- [x] Run `cargo test -p cairn-raft transport::tcp::tests` and confirm it fails because
   `TcpTransport` is absent.
-- [ ] Implement the sender handshake, LE length framing, bincode encoding/decoding,
+- [x] Implement the sender handshake, LE length framing, bincode encoding/decoding,
   listener and reader tasks, lazy writer cache, failed-writer eviction, one reconnect
   attempt per send, and inbound channel.
-- [ ] Re-run focused and full crate tests.
-- [ ] Commit as `feat(raft): add framed TCP transport`.
+- [x] Re-run focused and full crate tests.
+- [x] Commit as `feat(raft): add framed TCP transport`.
 
 ### Task 4: Notes, quality gates, and review
 
@@ -206,11 +236,11 @@ pub async fn TcpTransport::set_peer(&self, node_id: NodeId, addr: SocketAddr);
 
 - Modify: `crates/raft/TRANSPORT_NOTES.md`
 
-- [ ] Replace planned wording with final exact signatures and record any actual
+- [x] Replace planned wording with final exact signatures and record any actual
   contract deviations.
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `cargo test -p cairn-raft`.
-- [ ] Run `cargo build`.
-- [ ] Run `cargo clippy -p cairn-raft --all-targets -- -D warnings`.
-- [ ] Review the complete branch diff against the frozen contract and permitted files.
-- [ ] Commit final note corrections as `docs(raft): finalize transport usage notes`.
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run `cargo test -p cairn-raft`.
+- [x] Run `cargo build`.
+- [x] Run `cargo clippy --all-targets -- -D warnings`.
+- [x] Review the complete branch diff against the frozen contract and permitted files.
+- [x] Commit final note corrections as `docs(raft): finalize transport usage notes`.
