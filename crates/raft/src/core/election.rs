@@ -17,6 +17,11 @@ impl<S: RaftStorage> RaftCore<S> {
     /// bump its term (and disrupt the cluster) unless it could actually win.
     pub(super) fn start_prevote(&mut self) -> Result<()> {
         self.role = Role::PreCandidate;
+        // A pre-candidate has no current leader (it's guessing at whether
+        // it could win, not adopting anyone else's authority) — a stale
+        // leader_id left over from before would misdirect a driver's client
+        // redirects.
+        self.leader_id = None;
         self.votes = BTreeSet::new();
         self.votes.insert(self.config.id);
         let req = RequestVoteReq {
@@ -97,6 +102,10 @@ impl<S: RaftStorage> RaftCore<S> {
         // it rather than risk a stale success being popped against this
         // term's (re-initialized) next_index/match_index.
         self.inflight.clear();
+        // A fresh leader must not inherit a prior incarnation's queued
+        // reads — those were registered against a floor/quorum-contact
+        // state that no longer means anything under this leadership.
+        self.pending_reads.clear();
 
         let self_id = self.config.id;
         let next = self.storage.last_index() + 1;
@@ -121,7 +130,16 @@ impl<S: RaftStorage> RaftCore<S> {
         // committed entries.
         self.readable_term = None;
 
-        self.broadcast_append()
+        self.broadcast_append()?;
+        // A solo leader (or, in general, a leader whose own append alone
+        // forms a majority) gets no AppendEntriesResp to trigger commit
+        // advancement from — handle_append_resp is the only other caller of
+        // maybe_advance_commit, and a lone node never receives a reply.
+        // Without this, its own no-op (and every write it accepts) would
+        // never commit, readable_term would never get set, and reads would
+        // never release. This is a no-op for a multi-node leader, whose
+        // self-append alone can't reach quorum.
+        self.maybe_advance_commit()
     }
 
     /// Steps down to follower. Persists the new term (and clears
@@ -161,12 +179,25 @@ impl<S: RaftStorage> RaftCore<S> {
             self.outbox.push((
                 from,
                 Message::RequestVoteResp(RequestVoteResp {
-                    // Echo the CANDIDATE's prospective term (req.term), not
-                    // our own unbumped current_term: the pre-candidate's
-                    // tally compares resp.term against prospective_term, so
-                    // replying with current_term would make every grant
-                    // from a same-term peer look stale and get discarded.
-                    term: req.term,
+                    // Echo OUR OWN (unbumped) current_term, not the
+                    // candidate's prospective term. The frozen
+                    // RequestVoteResp wire type carries no pre_vote flag, so
+                    // this is the only way a Candidate's tally can tell a
+                    // pre-vote grant apart from a real-vote grant: a real
+                    // vote (cast at prospective_term via become_candidate's
+                    // persisted bump) always echoes a term equal to the
+                    // candidate's new current_term, while a pre-vote grant
+                    // echoes a term that's one lower. That means a pre-vote
+                    // grant delivered LATE -- after the recipient has
+                    // already promoted itself to a real Candidate at
+                    // prospective_term -- is filtered out as stale
+                    // (`resp.term < current_term`) instead of being
+                    // miscounted as a real vote. Without this, a delayed
+                    // pre-vote straggler could hand a Candidate a "vote" no
+                    // peer ever actually cast for its real election,
+                    // letting it win with zero genuine grants — a second
+                    // leader in the same term.
+                    term: self.current_term(),
                     vote_granted: granted,
                 }),
             ));
@@ -208,13 +239,16 @@ impl<S: RaftStorage> RaftCore<S> {
     pub(super) fn handle_vote_resp(&mut self, from: NodeId, resp: RequestVoteResp) -> Result<()> {
         match self.role {
             Role::PreCandidate => {
-                // While pre-candidate, current_term is unchanged; the
-                // pre-vote round we're running is for current_term + 1.
-                let prospective_term = self.current_term() + 1;
-                if resp.term > prospective_term {
+                // A pre-vote responder now echoes its OWN current_term (see
+                // handle_request_vote), not our prospective_term, so the
+                // comparison here is against our own current_term too — a
+                // peer at or behind our term can still legitimately grant a
+                // pre-vote; only a peer ahead of us means we're stale.
+                let current_term = self.current_term();
+                if resp.term > current_term {
                     return self.become_follower(resp.term, None);
                 }
-                if resp.term < prospective_term || !resp.vote_granted {
+                if !resp.vote_granted {
                     return Ok(());
                 }
                 self.votes.insert(from);
@@ -364,11 +398,14 @@ mod tests {
             c.tick().unwrap();
         } // -> PreCandidate, pre-vote out
         let _ = c.ready();
-        // grant pre-votes from 2 and 3
+        // Grant a pre-vote from peer 2. Under the fixed convention a
+        // pre-vote responder echoes its OWN current_term, not the
+        // candidate's prospective term — a fresh peer at term 0 grants with
+        // term 0.
         c.step(
             2,
             Message::RequestVoteResp(RequestVoteResp {
-                term: 1,
+                term: 0,
                 vote_granted: true,
             }),
         )
@@ -376,6 +413,8 @@ mod tests {
         assert_eq!(c.role(), Role::Candidate); // pre-vote won -> real candidate (term 1)
         assert_eq!(c.current_term(), 1);
         let _ = c.ready();
+        // Grant the REAL vote from peer 2: a real vote echoes the
+        // candidate's (now bumped) current_term, so this carries term 1.
         c.step(
             2,
             Message::RequestVoteResp(RequestVoteResp {
@@ -389,15 +428,16 @@ mod tests {
         assert!(c.commit_index() <= 1);
     }
 
-    // Finding 1 (Critical): a pre-vote responder must echo the CANDIDATE's
-    // prospective term (req.term), not its own unbumped current_term, or
-    // the pre-candidate's tally (which compares against prospective_term)
-    // discards every real grant and the cluster never promotes.
-    //
-    // This drives a REAL pre-vote round-trip through two nodes (not a
-    // hand-built resp) so it actually exercises the mismatch.
+    // C1 convention (whole-branch review): a pre-vote responder must echo
+    // ITS OWN (unbumped) current_term, not the candidate's prospective
+    // term — that's what lets a Candidate's tally (handle_vote_resp)
+    // distinguish a genuine, timely pre-vote grant from one delivered late
+    // after real candidacy has begun (see
+    // prevote_straggler_is_not_counted_as_real_vote). This is the
+    // happy-path companion: a real pre-vote round-trip through two nodes
+    // (not a hand-built resp) that legitimately wins promotion.
     #[test]
-    fn prevote_reply_term_matches_prospective_term_and_wins_real_round_trip() {
+    fn prevote_reply_echoes_responders_own_term_and_wins_real_round_trip() {
         // Node A: ticked past its election timeout -> PreCandidate at
         // prospective term 1 (current_term 0 + 1).
         let mut a = RaftCore::new(cfg(1, &[1, 2, 3]), MemStorage::default()).unwrap();
@@ -429,9 +469,9 @@ mod tests {
             })
             .expect("B must emit a RequestVoteResp");
         assert!(resp.vote_granted);
-        // The core assertion: B echoes the PROSPECTIVE term (1), not its
-        // own unbumped current_term (0).
-        assert_eq!(resp.term, 1);
+        // The core assertion: B echoes ITS OWN unbumped current_term (0),
+        // not A's prospective term (1).
+        assert_eq!(resp.term, 0);
         assert_eq!(b.current_term(), 0); // pre-vote must not mutate B's term
 
         // Feed B's real response back into A.
@@ -439,11 +479,104 @@ mod tests {
         assert_eq!(a.role(), Role::Candidate); // pre-vote quorum reached -> real candidate
     }
 
+    // C1 (Critical, whole-branch review): a pre-vote grant that is
+    // delivered LATE -- after the recipient has already promoted itself to
+    // a real Candidate -- must never be misread as a real-vote grant for
+    // the ongoing (real) election. If a pre-vote responder echoes the
+    // CANDIDATE's prospective term (the pre-fix behavior) rather than its
+    // own current term, a straggler carries the same term number the
+    // Candidate is now running at and slips past the `resp.term ==
+    // current_term` check in the Candidate branch of `handle_vote_resp`,
+    // letting a node reach leadership on stragglers alone -- with peers
+    // that never actually granted it a real vote. That's a second leader in
+    // the same term waiting to happen.
+    #[test]
+    fn prevote_straggler_is_not_counted_as_real_vote() {
+        // A: 3-node cluster, ticks past its election timeout into
+        // PreCandidate (prospective term 1, current_term still 0).
+        let mut a = RaftCore::new(cfg(1, &[1, 2, 3]), MemStorage::default()).unwrap();
+        for _ in 0..40 {
+            a.tick().unwrap();
+        }
+        assert_eq!(a.role(), Role::PreCandidate);
+        let a_ready = a.ready();
+        // A may have re-armed and re-sent pre-vote requests across several
+        // election-timeout rounds within these 40 ticks (each round resets
+        // its own deadline); only the latest request to each peer matters,
+        // so keep the last one seen per peer rather than every round's.
+        let mut pre_vote_reqs: BTreeMap<NodeId, RequestVoteReq> = BTreeMap::new();
+        for (to, m) in &a_ready.messages {
+            if let Message::RequestVote(rv) = m {
+                if rv.pre_vote {
+                    pre_vote_reqs.insert(*to, rv.clone());
+                }
+            }
+        }
+        assert_eq!(pre_vote_reqs.len(), 2, "A must pre-vote both peers");
+
+        // B (id 2) and C (id 3): fresh followers at term 0, each answer A's
+        // real pre-vote request through the real handler (not hand-built
+        // responses), so this test reflects whatever convention the code
+        // actually implements.
+        let mut b = RaftCore::new(cfg(2, &[1, 2, 3]), MemStorage::default()).unwrap();
+        let mut c = RaftCore::new(cfg(3, &[1, 2, 3]), MemStorage::default()).unwrap();
+        let req_to_b = pre_vote_reqs[&2].clone();
+        let req_to_c = pre_vote_reqs[&3].clone();
+        b.step(1, Message::RequestVote(req_to_b)).unwrap();
+        c.step(1, Message::RequestVote(req_to_c)).unwrap();
+        let b_resp = b
+            .ready()
+            .messages
+            .iter()
+            .find_map(|(_, m)| match m {
+                Message::RequestVoteResp(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("B must reply");
+        let c_resp = c
+            .ready()
+            .messages
+            .iter()
+            .find_map(|(_, m)| match m {
+                Message::RequestVoteResp(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("C must reply");
+        assert!(b_resp.vote_granted && c_resp.vote_granted);
+
+        // A processes B's grant first: reaches pre-vote quorum (self + B)
+        // and promotes straight to a REAL Candidate at term 1, broadcasting
+        // a real (non-pre-vote) RequestVote.
+        a.step(2, Message::RequestVoteResp(b_resp)).unwrap();
+        assert_eq!(a.role(), Role::Candidate);
+        assert_eq!(a.current_term(), 1);
+        let _ = a.ready(); // drain the real RequestVote broadcast
+
+        // C's pre-vote grant was computed BEFORE A ever promoted, but is
+        // only delivered now -- after A is already a real Candidate. It
+        // must not be misinterpreted as a grant for the real election: A
+        // must NOT reach leadership off a self-vote plus this straggler
+        // alone.
+        a.step(3, Message::RequestVoteResp(c_resp)).unwrap();
+        assert_eq!(
+            a.role(),
+            Role::Candidate,
+            "a delayed pre-vote grant must not, by itself, promote a Candidate to Leader"
+        );
+    }
+
     // Finding 2 (liveness gap): a single-node cluster has self already at
     // quorum the instant it seeds votes in start_prevote/become_candidate,
     // but quorum was previously only re-checked when a vote RESPONSE
     // arrived -- which a solo node never gets. It must self-promote all
     // the way to Leader in one tick sequence.
+    //
+    // I1: promotion alone isn't enough -- `maybe_advance_commit` was only
+    // ever called from `handle_append_resp`, which a solo leader (no peers
+    // to respond) never receives. Without a call from `become_leader`
+    // itself, the solo leader's own no-op never commits, `readable_term`
+    // never gets set, and reads can never release. Assert both halves:
+    // promotion to Leader AND that its self-majority commits the no-op.
     #[test]
     fn single_node_cluster_self_promotes_to_leader() {
         let mut c = RaftCore::new(cfg(1, &[1]), MemStorage::default()).unwrap();
@@ -452,5 +585,21 @@ mod tests {
         }
         assert_eq!(c.role(), Role::Leader);
         assert_eq!(c.current_term(), 1);
+        // The no-op appended in become_leader (index 1, term 1) must have
+        // committed off self alone -- a solo node already IS a majority.
+        assert_eq!(c.commit_index(), 1);
+        let r = c.ready();
+        assert_eq!(r.apply.len(), 1);
+        assert_eq!(r.apply[0].index, 1);
+        assert_eq!(r.apply[0].term, 1);
+        // Readability follows: a fresh leader can't serve linearizable
+        // reads until its own no-op has committed and applied.
+        c.read_index(1);
+        let r2 = c.ready();
+        assert_eq!(
+            r2.reads,
+            vec![1],
+            "solo leader must be able to release a read once its no-op has committed"
+        );
     }
 }

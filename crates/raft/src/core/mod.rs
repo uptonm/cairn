@@ -303,16 +303,19 @@ mod tests {
         }
         assert_eq!(core.role(), Role::PreCandidate);
         let _ = core.ready();
+        // Pre-vote grant: a fresh peer at term 0 echoes its own current_term
+        // (0), not the candidate's prospective term.
         core.step(
             2,
             Message::RequestVoteResp(RequestVoteResp {
-                term: 1,
+                term: 0,
                 vote_granted: true,
             }),
         )
         .unwrap();
         assert_eq!(core.role(), Role::Candidate);
         let _ = core.ready();
+        // Real vote grant: echoes the (now bumped) candidate's current_term.
         core.step(
             2,
             Message::RequestVoteResp(RequestVoteResp {

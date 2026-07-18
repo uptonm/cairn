@@ -117,15 +117,18 @@ mod tests {
         }
         let _ = c.ready();
         let others: Vec<NodeId> = peers.iter().copied().filter(|&p| p != id).collect();
+        // Pre-vote grant: a fresh peer at term 0 echoes its own current_term
+        // (0), not the candidate's prospective term.
         c.step(
             others[0],
             Message::RequestVoteResp(RequestVoteResp {
-                term: 1,
+                term: 0,
                 vote_granted: true,
             }),
         )
         .unwrap();
         let _ = c.ready();
+        // Real vote grant: echoes the (now bumped) candidate's current_term.
         c.step(
             others[0],
             Message::RequestVoteResp(RequestVoteResp {

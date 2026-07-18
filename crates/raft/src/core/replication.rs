@@ -23,6 +23,11 @@ impl<S: RaftStorage> RaftCore<S> {
         self.next_index.insert(self_id, index + 1);
 
         self.broadcast_append()?;
+        // Mirrors become_leader's call: a leader whose own append alone
+        // forms a majority (the solo-cluster case) gets no
+        // AppendEntriesResp to trigger commit advancement from — without
+        // this, a solo leader's proposals would never commit.
+        self.maybe_advance_commit()?;
         Ok(Some(index))
     }
 
@@ -276,7 +281,7 @@ impl<S: RaftStorage> RaftCore<S> {
     /// from `last_index()` down to `commit_index + 1` and take the first
     /// (i.e. highest) one that qualifies, which is always `>= commit_index`
     /// by construction of the scan range.
-    fn maybe_advance_commit(&mut self) -> Result<()> {
+    pub(super) fn maybe_advance_commit(&mut self) -> Result<()> {
         if self.role != Role::Leader {
             return Ok(());
         }
@@ -364,15 +369,18 @@ mod tests {
         }
         let _ = c.ready();
         let others: Vec<NodeId> = peers.iter().copied().filter(|&p| p != id).collect();
+        // Pre-vote grant: a fresh peer at term 0 echoes its own current_term
+        // (0), not the candidate's prospective term.
         c.step(
             others[0],
             Message::RequestVoteResp(RequestVoteResp {
-                term: 1,
+                term: 0,
                 vote_granted: true,
             }),
         )
         .unwrap();
         let _ = c.ready();
+        // Real vote grant: echoes the (now bumped) candidate's current_term.
         c.step(
             others[0],
             Message::RequestVoteResp(RequestVoteResp {
