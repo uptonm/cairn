@@ -10,6 +10,7 @@ enum Op {
     Get(Vec<u8>),
     Flush,
     Compact,
+    Reopen,
 }
 
 fn small_key() -> impl Strategy<Value = Vec<u8>> {
@@ -24,6 +25,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         small_key().prop_map(Op::Get),
         Just(Op::Flush),
         Just(Op::Compact),
+        Just(Op::Reopen),
     ]
 }
 
@@ -42,6 +44,10 @@ proptest! {
                 }
                 Op::Flush => engine.flush().unwrap(),
                 Op::Compact => engine.compact().unwrap(),
+                Op::Reopen => {
+                    drop(engine);
+                    engine = Engine::open(dir.path()).unwrap();
+                }
             }
         }
     }

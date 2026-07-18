@@ -46,6 +46,17 @@ impl Engine {
             sstables.push((*id, SsTableReader::open(&path)?));
         }
         let next_sst_id = sst_ids.last().map_or(0, |m| m + 1);
+        // `flush()` empties the WAL, so on reopen the WAL alone under-reports
+        // next_seqno once anything has been flushed: the seqnos of flushed
+        // entries only survive on disk inside the SSTables themselves. Scan
+        // every loaded SSTable's entries too, so a reopen never reissues a
+        // seqno that a compaction could later treat as "older" than a stale
+        // pre-reopen value with a higher seqno.
+        for (_, sst) in &sstables {
+            for (ik, _) in sst.iter()? {
+                next_seqno = next_seqno.max(ik.seqno + 1);
+            }
+        }
         let wal = WalWriter::create(&wal_path)?;
         Ok(Engine {
             dir: dir.to_path_buf(),
@@ -297,6 +308,30 @@ mod tests {
         let e = Engine::open(dir.path()).unwrap();
         for i in 0..10u8 {
             assert_eq!(e.get(&[i]).unwrap(), Some(vec![i, i]));
+        }
+    }
+
+    #[test]
+    fn seqno_recovered_across_reopen_prevents_stale_resurrection() {
+        let dir = tempdir().unwrap();
+        {
+            // s0, s1; flush publishes k@1->C and empties the WAL.
+            let mut e = Engine::open(dir.path()).unwrap();
+            e.put(b"a", b"x").unwrap();
+            e.put(b"k", b"C").unwrap();
+            e.flush().unwrap();
+        }
+        {
+            // Without SSTable-derived recovery, next_seqno would wrongly
+            // reset to 0 here (the WAL is empty), so this put would reuse
+            // seqno 0 and be outranked by the already-flushed k@1->C.
+            let mut e = Engine::open(dir.path()).unwrap();
+            e.put(b"k", b"Z").unwrap();
+            e.flush().unwrap();
+            e.compact().unwrap();
+
+            assert_eq!(e.get(b"k").unwrap(), Some(b"Z".to_vec()));
+            assert_eq!(e.get(b"a").unwrap(), Some(b"x".to_vec()));
         }
     }
 
