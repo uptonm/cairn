@@ -6,6 +6,7 @@ use crate::wal::WalWriter;
 use std::path::{Path, PathBuf};
 
 const MEMTABLE_FLUSH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SSTABLES_BEFORE_COMPACT: usize = 4;
 
 pub struct Engine {
     dir: PathBuf,
@@ -115,6 +116,48 @@ impl Engine {
         std::fs::remove_file(&wal_path)?;
         self.wal = WalWriter::create(&wal_path)?;
         self.memtable = Memtable::new();
+
+        if self.sstables.len() > MAX_SSTABLES_BEFORE_COMPACT {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    pub fn compact(&mut self) -> Result<()> {
+        if self.sstables.len() < 2 {
+            return Ok(());
+        }
+        // Merge every table's entries; entries per table are already sorted
+        // newest-first within a key. Collect, sort by InternalKey, then keep
+        // the first (newest) version seen per user_key and drop tombstones.
+        let mut all: Vec<(crate::types::InternalKey, Option<Vec<u8>>)> = Vec::new();
+        for (_, sst) in &self.sstables {
+            all.extend(sst.iter()?);
+        }
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let id = self.next_sst_id;
+        self.next_sst_id += 1;
+        let path = self.dir.join(format!("{id:06}.sst"));
+        let mut w = SsTableWriter::create(&path)?;
+        let mut last_key: Option<Vec<u8>> = None;
+        for (ik, value) in all {
+            if last_key.as_deref() == Some(ik.user_key.as_slice()) {
+                continue; // older version of a key we already wrote
+            }
+            last_key = Some(ik.user_key.clone());
+            if value.is_none() {
+                continue; // drop tombstone in a full merge
+            }
+            w.add(&ik, &value)?;
+        }
+        w.finish()?;
+
+        let old_ids: Vec<u64> = self.sstables.iter().map(|(id, _)| *id).collect();
+        self.sstables = vec![(id, SsTableReader::open(&path)?)];
+        for old in old_ids {
+            let _ = std::fs::remove_file(self.dir.join(format!("{old:06}.sst")));
+        }
         Ok(())
     }
 }
@@ -197,5 +240,47 @@ mod tests {
         }
         let e = Engine::open(dir.path()).unwrap();
         assert_eq!(e.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn compaction_keeps_newest_and_drops_tombstones() {
+        let dir = tempdir().unwrap();
+        let mut e = Engine::open(dir.path()).unwrap();
+        e.put(b"a", b"old").unwrap();
+        e.flush().unwrap();
+        e.put(b"a", b"new").unwrap();
+        e.put(b"b", b"1").unwrap();
+        e.flush().unwrap();
+        e.delete(b"b").unwrap();
+        e.flush().unwrap();
+
+        e.compact().unwrap();
+
+        assert_eq!(e.get(b"a").unwrap(), Some(b"new".to_vec()));
+        assert_eq!(e.get(b"b").unwrap(), None);
+        // After full compaction only one SSTable remains.
+        let ssts = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".sst"))
+            .count();
+        assert_eq!(ssts, 1);
+    }
+
+    #[test]
+    fn data_survives_compaction_and_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut e = Engine::open(dir.path()).unwrap();
+            for i in 0..10u8 {
+                e.put(&[i], &[i, i]).unwrap();
+                e.flush().unwrap();
+            }
+            e.compact().unwrap();
+        }
+        let e = Engine::open(dir.path()).unwrap();
+        for i in 0..10u8 {
+            assert_eq!(e.get(&[i]).unwrap(), Some(vec![i, i]));
+        }
     }
 }
