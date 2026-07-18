@@ -251,52 +251,88 @@ async fn run_scheduler(
     mut incoming: mpsc::UnboundedReceiver<ScheduledDelivery>,
     destinations: Arc<HashMap<NodeId, Destination>>,
 ) {
+    const MAX_INCOMING_BATCH: usize = 64;
+
     let mut pending = BinaryHeap::new();
-    let mut incoming_closed = false;
 
     loop {
-        while !incoming_closed {
-            match incoming.try_recv() {
-                Ok(delivery) => pending.push(delivery),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => incoming_closed = true,
-            }
+        if incoming.is_closed() {
+            fail_queued_deliveries(&mut incoming, &mut pending);
+            return;
         }
 
-        let Some(next_deadline) = pending.peek().map(|delivery| delivery.deadline) else {
-            if incoming_closed {
-                break;
-            }
-            match incoming.recv().await {
-                Some(delivery) => pending.push(delivery),
-                None => incoming_closed = true,
-            }
-            continue;
-        };
-
-        if next_deadline <= Instant::now() {
+        if pending
+            .peek()
+            .is_some_and(|delivery| delivery.deadline <= Instant::now())
+        {
             if let Some(delivery) = pending.pop() {
                 deliver(delivery, &destinations);
             }
             continue;
         }
 
-        if incoming_closed {
-            tokio::time::sleep_until(next_deadline).await;
+        let mut batch_size = 0;
+        while batch_size < MAX_INCOMING_BATCH {
+            match incoming.try_recv() {
+                Ok(delivery) => {
+                    pending.push(delivery);
+                    batch_size += 1;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    fail_queued_deliveries(&mut incoming, &mut pending);
+                    return;
+                }
+            }
+        }
+
+        if batch_size == MAX_INCOMING_BATCH {
             continue;
         }
 
+        let Some(next_deadline) = pending.peek().map(|delivery| delivery.deadline) else {
+            match incoming.recv().await {
+                Some(delivery) => pending.push(delivery),
+                None => {
+                    fail_queued_deliveries(&mut incoming, &mut pending);
+                    return;
+                }
+            }
+            continue;
+        };
+
         tokio::select! {
-            biased;
             delivery = incoming.recv() => {
                 match delivery {
                     Some(delivery) => pending.push(delivery),
-                    None => incoming_closed = true,
+                    None => {
+                        fail_queued_deliveries(&mut incoming, &mut pending);
+                        return;
+                    }
                 }
             }
             _ = tokio::time::sleep_until(next_deadline) => {}
         }
     }
+}
+
+fn fail_queued_deliveries(
+    incoming: &mut mpsc::UnboundedReceiver<ScheduledDelivery>,
+    pending: &mut BinaryHeap<ScheduledDelivery>,
+) {
+    while let Ok(delivery) = incoming.try_recv() {
+        fail_delivery(delivery);
+    }
+    while let Some(delivery) = pending.pop() {
+        fail_delivery(delivery);
+    }
+}
+
+fn fail_delivery(delivery: ScheduledDelivery) {
+    let _ = delivery.acknowledgement.send(Err(io_error(
+        ErrorKind::BrokenPipe,
+        "in-memory transport scheduler input is closed",
+    )));
 }
 
 fn deliver(delivery: ScheduledDelivery, destinations: &HashMap<NodeId, Destination>) {
@@ -352,11 +388,15 @@ fn io_error(kind: ErrorKind, message: impl Into<String>) -> crate::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::InMemoryTransport;
+    use super::{run_scheduler, InMemoryTransport, ScheduledDelivery};
     use crate::rpc::{Message, RequestVoteResp};
     use crate::transport::Transport;
     use crate::Error;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::Instant;
 
     fn message(term: u64) -> Message {
         Message::RequestVoteResp(RequestVoteResp {
@@ -453,5 +493,83 @@ mod tests {
         drop(endpoints.remove(&2));
 
         assert!(matches!(one.send(2, message(61)).await, Err(Error::Io(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn due_delivery_is_not_starved_by_a_large_input_backlog() {
+        let (incoming, incoming_receiver) = mpsc::unbounded_channel();
+        let (destination, mut destination_receiver) = mpsc::unbounded_channel();
+        let destinations = Arc::new(HashMap::from([(2, destination)]));
+        let (due_acknowledgement, due_result) = oneshot::channel();
+        let now = Instant::now();
+
+        incoming
+            .send(ScheduledDelivery {
+                deadline: now,
+                sequence: 0,
+                from: 1,
+                to: 2,
+                message: message(71),
+                acknowledgement: due_acknowledgement,
+            })
+            .unwrap();
+        for sequence in 1..=250_000 {
+            let (acknowledgement, result) = oneshot::channel();
+            drop(result);
+            incoming
+                .send(ScheduledDelivery {
+                    deadline: now + Duration::from_secs(60),
+                    sequence,
+                    from: 1,
+                    to: 2,
+                    message: message(72),
+                    acknowledgement,
+                })
+                .unwrap();
+        }
+
+        let scheduler = tokio::spawn(run_scheduler(incoming_receiver, destinations));
+        let result = tokio::time::timeout(Duration::from_millis(5), due_result).await;
+        scheduler.abort();
+        drop(incoming);
+        let _ = scheduler.await;
+
+        assert!(
+            result.is_ok(),
+            "due delivery was starved while scheduler drained incoming work"
+        );
+        assert!(result.unwrap().unwrap().is_ok());
+        assert_eq!(destination_receiver.recv().await, Some((1, message(71))));
+    }
+
+    #[tokio::test]
+    async fn pending_deliveries_fail_when_scheduler_input_closes() {
+        let (incoming, incoming_receiver) = mpsc::unbounded_channel();
+        let (destination, _destination_receiver) = mpsc::unbounded_channel();
+        let destinations = Arc::new(HashMap::from([(2, destination)]));
+        let (acknowledgement, result) = oneshot::channel();
+
+        incoming
+            .send(ScheduledDelivery {
+                deadline: Instant::now() + Duration::from_secs(60),
+                sequence: 0,
+                from: 1,
+                to: 2,
+                message: message(81),
+                acknowledgement,
+            })
+            .unwrap();
+        drop(incoming);
+
+        let mut scheduler = tokio::spawn(run_scheduler(incoming_receiver, destinations));
+        let acknowledgement = tokio::time::timeout(Duration::from_millis(50), result).await;
+        let exit = tokio::time::timeout(Duration::from_millis(50), &mut scheduler).await;
+        if exit.is_err() {
+            scheduler.abort();
+            let _ = scheduler.await;
+        }
+
+        assert!(matches!(acknowledgement, Ok(Ok(Err(Error::Io(_))))));
+        assert!(exit.is_ok(), "scheduler did not exit when input closed");
     }
 }
