@@ -99,11 +99,13 @@ pub struct RaftCore<S: RaftStorage> {
     /// advancing it past two overlapping in-flight requests (see the
     /// Task-4 self-review / Task-4 fix-pass-1 report).
     inflight: BTreeMap<NodeId, VecDeque<LogIndex>>,
-    /// Wired up in Task 4/5 to track per-peer AppendEntries liveness.
-    #[allow(dead_code)]
+    /// Per-peer tick at which the leader last heard a same-term
+    /// AppendEntries success from that peer. Read by read_index.rs's
+    /// quorum-contact gate.
     last_contact_tick: BTreeMap<NodeId, u64>,
-    /// Wired up in Task 4+ for AppendEntries/heartbeat pacing diagnostics.
-    #[allow(dead_code)]
+    /// Ticks elapsed since `RaftCore::new`, incremented once per `tick()`.
+    /// Stamped into `last_contact_tick` and compared against
+    /// `PendingRead::registered_tick` by read_index.rs.
     tick_count: u64,
     /// Reads registered via `read_index` awaiting release; see
     /// core/read_index.rs.

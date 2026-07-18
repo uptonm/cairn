@@ -216,6 +216,15 @@ impl<S: RaftStorage> RaftCore<S> {
         if self.role != Role::Leader {
             return Ok(());
         }
+        // A reply from an OLDER term is stale — it can't attest to
+        // anything about this leader's current term, so it must not touch
+        // last_contact_tick/match_index/next_index/inflight, nor trigger
+        // commit advancement or a read release. Only a same-term reply
+        // proceeds past this point (standard Raft rule: ignore replies
+        // whose term doesn't match the term the request was sent in).
+        if resp.term < self.current_term() {
+            return Ok(());
+        }
 
         if resp.success {
             // Pop the oldest outstanding request's extent, not the newest:

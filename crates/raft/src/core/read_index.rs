@@ -290,4 +290,118 @@ mod tests {
         let r = c.ready();
         assert_eq!(r.reads, vec![42]);
     }
+
+    // --- Bug 1 (fix pass 1): stale-term AppendEntriesResp must not count
+    // as post-registration contact ---
+    //
+    // Reviewer's exact scenario: `handle_append_resp` rejected only
+    // `resp.term > current_term` (step down), so a delayed reply from an
+    // OLDER term fell through to the success branch and stamped
+    // `last_contact_tick`, letting a stale reply satisfy read-index's
+    // quorum-contact gate for a read a quorum never actually confirmed in
+    // the current term. This is a stale read / linearizability violation.
+
+    /// Hand-built leader at an arbitrary `term`, already fully "readable"
+    /// (current-term entry applied, per (b)) and with its own
+    /// self-contact/apply state satisfied, so the only thing a test needs
+    /// to drive is the (c) quorum-contact gate. Bypasses the election
+    /// round trip (which always lands on term 1) so the test can pick a
+    /// `term` high enough that `term - 1` is a distinct, meaningful older
+    /// term for a stale reply.
+    fn leader_at_term(term: Term) -> RaftCore<MemStorage> {
+        let mut s = MemStorage::default();
+        s.save_hard_state(&HardState {
+            current_term: term,
+            voted_for: Some(1),
+        })
+        .unwrap();
+        let mut c = RaftCore::new(cfg(1, &[1, 2, 3]), s).unwrap();
+        c.role = Role::Leader;
+        c.leader_id = Some(1);
+        c.readable_term = Some(term);
+        c
+    }
+
+    #[test]
+    fn stale_term_append_resp_does_not_release_read() {
+        let term: Term = 5;
+        let mut c = leader_at_term(term);
+
+        // Register the read at tick T (= 0 here).
+        c.read_index(99);
+        assert_eq!(c.pending_reads.len(), 1);
+
+        // Advance one tick (T+1) so tick_count > registered_tick, then
+        // deliver a delayed AppendEntriesResp from an OLDER term. Under the
+        // bug this stamps last_contact_tick[2] = T+1 anyway, satisfying
+        // quorum (self + peer 2) even though peer 2 never affirmed this
+        // leader in the current term.
+        c.tick().unwrap();
+        c.step(
+            2,
+            Message::AppendEntriesResp(AppendEntriesResp {
+                term: term - 1,
+                success: true,
+                conflict_index: None,
+            }),
+        )
+        .unwrap();
+
+        // Tick several more times: the read must never release, because
+        // the only "contact" on record is a stale-term reply that must be
+        // ignored.
+        for _ in 0..10 {
+            c.tick().unwrap();
+            let r = c.ready();
+            assert!(
+                r.reads.is_empty(),
+                "stale-term AppendEntriesResp must not release a pending read"
+            );
+        }
+        assert_eq!(c.pending_reads.len(), 1, "read must remain pending");
+    }
+
+    /// Companion to the above: proves the fix doesn't over-reject. A
+    /// CURRENT-term success reply still refreshes contact and still
+    /// releases the read.
+    #[test]
+    fn current_term_append_resp_still_releases_read() {
+        let term: Term = 5;
+        let mut c = leader_at_term(term);
+
+        c.read_index(100);
+        assert_eq!(c.pending_reads.len(), 1);
+
+        c.tick().unwrap();
+        c.step(2, success_resp(term)).unwrap();
+
+        let r = c.ready();
+        assert_eq!(r.reads, vec![100]);
+    }
+
+    // --- Bug 3: readable_term gate must be `== Some(current_term())`, not
+    // `is_some()` ---
+
+    #[test]
+    fn read_not_released_when_readable_term_is_stale() {
+        let term: Term = 5;
+        let mut c = leader_at_term(term);
+        // Simulate a stale leftover readable_term from a prior term rather
+        // than the fresh-leader `None` case already covered by
+        // `read_waits_for_current_term_commit`.
+        c.readable_term = Some(term - 1);
+
+        c.read_index(55);
+        assert_eq!(c.pending_reads.len(), 1);
+
+        c.tick().unwrap();
+        c.step(2, success_resp(term)).unwrap();
+
+        let r = c.ready();
+        assert!(
+            r.reads.is_empty(),
+            "a stale (non-current) readable_term must not satisfy the gate"
+        );
+        assert_eq!(c.pending_reads.len(), 1);
+    }
 }
