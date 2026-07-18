@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::Result;
-use crate::rpc::{Message, RequestVoteReq};
+use crate::rpc::Message;
 use crate::storage::RaftStorage;
-use crate::types::{LogEntry, LogIndex, NodeId, Term};
+use crate::types::{HardState, LogEntry, LogIndex, NodeId, Term};
+
+mod election;
 
 pub type ReadToken = u64;
 
@@ -63,13 +65,15 @@ struct PendingRead {
 /// (storage, transport) is pushed to the caller via `Ready`; `RaftCore`
 /// itself never blocks or performs side effects beyond mutating its own
 /// state and buffering outbound messages/applies/read releases.
-#[allow(dead_code)]
 pub struct RaftCore<S: RaftStorage> {
     config: Config,
     storage: S,
     role: Role,
     leader_id: Option<NodeId>,
     commit_index: LogIndex,
+    /// Wired up in Task 5 to track the apply-loop's progress against
+    /// `commit_index`.
+    #[allow(dead_code)]
     last_applied: LogIndex,
     /// Ticks elapsed since the last leader contact / election reset.
     elapsed: u64,
@@ -80,8 +84,14 @@ pub struct RaftCore<S: RaftStorage> {
     votes: BTreeSet<NodeId>,
     next_index: BTreeMap<NodeId, LogIndex>,
     match_index: BTreeMap<NodeId, LogIndex>,
+    /// Wired up in Task 4/5 to track per-peer AppendEntries liveness.
+    #[allow(dead_code)]
     last_contact_tick: BTreeMap<NodeId, u64>,
+    /// Wired up in Task 4+ for AppendEntries/heartbeat pacing diagnostics.
+    #[allow(dead_code)]
     tick_count: u64,
+    /// Wired up in Task 6 for linearizable read barriers.
+    #[allow(dead_code)]
     pending_reads: Vec<PendingRead>,
     /// Term whose entry has committed, enabling reads at or before it.
     readable_term: Option<Term>,
@@ -170,12 +180,12 @@ impl<S: RaftStorage> RaftCore<S> {
 
     /// Dispatch skeleton. `InstallSnapshot`/`InstallSnapshotResp` are
     /// permanently ignored here (snapshot install is out of RaftCore's
-    /// scope). The remaining arms are filled in by Tasks 3-6.
-    pub fn step(&mut self, _from: NodeId, msg: Message) -> Result<()> {
+    /// scope). `AppendEntries`/`AppendEntriesResp` are filled in by Task 4.
+    pub fn step(&mut self, from: NodeId, msg: Message) -> Result<()> {
         match msg {
             Message::InstallSnapshot(_) | Message::InstallSnapshotResp(_) => Ok(()),
-            Message::RequestVote(_) => Ok(()),
-            Message::RequestVoteResp(_) => Ok(()),
+            Message::RequestVote(req) => self.handle_request_vote(from, req),
+            Message::RequestVoteResp(resp) => self.handle_vote_resp(from, resp),
             Message::AppendEntries(_) => Ok(()),
             Message::AppendEntriesResp(_) => Ok(()),
         }
@@ -186,30 +196,14 @@ impl<S: RaftStorage> RaftCore<S> {
         self.election_deadline = self.rng.election_timeout(self.config.election_timeout);
     }
 
-    /// Minimal Task 2 stub: becomes a pre-candidate and broadcasts a
-    /// pre-vote `RequestVote` to every peer. Vote counting and the
-    /// pre-vote -> real-vote promotion are added in Task 3.
-    fn start_prevote(&mut self) {
-        self.role = Role::PreCandidate;
-        let req = RequestVoteReq {
-            term: self.current_term() + 1,
-            candidate_id: self.config.id,
-            last_log_index: self.storage.last_index(),
-            last_log_term: self.storage.last_term(),
-            pre_vote: true,
-        };
-        let self_id = self.config.id;
-        for &peer in &self.config.peers {
-            if peer != self_id {
-                self.outbox.push((peer, Message::RequestVote(req.clone())));
-            }
-        }
-        self.reset_election_timer();
-    }
-
     /// No-op stub; wired up in Task 6 to release pending linearizable reads
     /// once `readable_term` confirms the leader's term has committed.
     fn maybe_release_reads(&mut self) {}
+
+    #[cfg(test)]
+    pub(crate) fn stored_hard_state(&self) -> HardState {
+        self.storage.hard_state()
+    }
 }
 
 #[cfg(test)]
