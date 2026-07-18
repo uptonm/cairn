@@ -1,0 +1,52 @@
+---
+title: Atomic flush via temp+rename
+description: Why a flush or compaction never publishes a partially-written SSTable.
+---
+
+## Decision
+
+Every file a flush or compaction produces is written at a `.sst.tmp` path
+first, fully finished (all entries written, footer flushed, `sync_all`'d),
+and only then published with `std::fs::rename` to its real `NNNNNN.sst`
+name. `Engine::open`'s SSTable discovery only ever looks for `*.sst` files —
+a `.tmp` file left behind by a crash mid-write is invisible to it and simply
+orphaned.
+
+## The problem this closes
+
+The first version of `flush()` wrote directly to the final `NNNNNN.sst`
+path. If the process crashed partway through `SsTableWriter::add`/`finish` —
+after `File::create` truncated or created the file, but before the footer
+was written — `Engine::open` would discover that file on the next start,
+try to open it as a real SSTable, and fail: `SsTableReader::open` rejects
+anything shorter than a full footer as corrupt. A crash during a routine
+flush could brick the engine on restart.
+
+## Why rename, not fsync-and-hope
+
+`rename(2)` is atomic on POSIX for renames within the same filesystem: a
+reader either sees the old name (nothing changed yet) or the new name
+(fully written file), never a half-written file under the final name.
+That's a stronger guarantee than "we fsync'd before anyone should have
+looked" — it doesn't depend on timing, and it doesn't require discovery
+logic to distinguish a torn write from a legitimate corrupt file.
+
+## Flush ordering: WAL rotation before memtable clear
+
+A related ordering fix: `flush()` rotates the WAL (delete old, create new)
+*before* clearing the in-memory memtable, not after. If WAL rotation fails
+partway, the memtable — which still holds every entry that was just written
+to the (now-published) SSTable — is the fallback source of truth rather
+than a memory region that's already been reset. The data is redundant
+across the memtable and the new SSTable for one brief window, never
+missing.
+
+## Same discipline for compaction
+
+Compaction merges N SSTables into one. The merged output is written to a
+temp path, `rename`'d into place, and **only then** are the N input files
+deleted — cleanup failures on the old files are surfaced as errors rather
+than silently swallowed, since a failed cleanup leaves harmless extra data
+on disk, not a hazard. If the process died between publishing the merged
+table and deleting the inputs, restart just sees an extra (correct, just
+redundant) source of the same key ranges.

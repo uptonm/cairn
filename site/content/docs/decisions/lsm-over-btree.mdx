@@ -1,0 +1,54 @@
+---
+title: LSM over B-tree
+description: Why the storage engine is log-structured, and why the Raft log store is a separate component rather than another LSM consumer.
+---
+
+## Decision
+
+cairn's local storage engine is a log-structured merge-tree: an append-only
+WAL feeding an in-memory memtable, flushed to immutable SSTables, reconciled
+by background compaction — not an in-place B-tree.
+
+## Why LSM
+
+A B-tree mutates its on-disk pages in place: every write, even a single-key
+update, can touch multiple pages and requires either careful write-ahead
+logging of page changes or a copy-on-write scheme to stay crash-safe, and
+random-access page writes are the norm rather than the exception. An LSM
+tree turns the write path into two sequential-append operations — the WAL
+and the memtable — and defers the cost of reorganizing on-disk layout to a
+background compaction process that runs on its own schedule. That trade
+(sequential writes now, background merge cost later, some read
+amplification from checking multiple SSTables) is well suited to a system
+where write durability and throughput are load-bearing project goals and
+the storage layer needs to be buildable and independently correctness-tested
+in a single, well-scoped cycle.
+
+It also composes cleanly with what the layers above it need: sequence
+numbers threading through every write (`InternalKey { user_key, seqno }`)
+give the future MVCC layer versioned keys for free, and immutable SSTables
+are trivial to reason about under concurrent readers — nothing is ever
+mutated after `finish()`, only superseded by a newer table.
+
+## Why the Raft log store is *not* another LSM consumer
+
+A natural-seeming shortcut once the LSM engine exists is to make the Raft
+log just another user of it — index the log entries as KV pairs and get
+persistence for free. The Raft design spec deliberately rejects that:
+
+> Raft-log semantics — index-keyed entries, suffix truncation on conflict,
+> snapshot-driven prefix compaction — differ enough from a KV store that
+> reusing the LSM would bend it out of shape.
+
+Concretely: a Raft log needs **suffix truncation** (throw away every entry
+after a conflict point when a follower's log diverges from the leader's),
+which has no clean analogue in an LSM engine built around append-only,
+newest-wins semantics — modeling truncation as a flood of tombstones would
+work, but would fight the data structure instead of matching its grain. A
+Raft log is also addressed by a dense integer index, not an arbitrary key,
+and its compaction is driven by snapshot metadata rather than a size
+threshold. The Raft log store reuses the *ideas* proven in the KV engine —
+checksummed records, crash-tolerant replay, append-then-fsync durability —
+without inheriting a data structure shaped for a different access pattern.
+Keeping that boundary clean is exactly the kind of narrow, single-purpose
+interface the whole system is built from: see [Architecture](/docs/architecture#components).

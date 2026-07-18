@@ -1,0 +1,47 @@
+---
+title: Compaction
+description: How cairn reclaims space and drops shadowed versions and tombstones.
+---
+
+## What compaction does
+
+Flushing produces one new SSTable per memtable, and reads degrade as that
+count grows — every extra table is another bloom check and potential disk
+seek per lookup. Compaction merges SSTables back down: it collects every
+entry across the current set of tables, sorts by `InternalKey` (newest
+version of a key first, by construction — see [Memtable](/docs/lsm-engine/memtable)),
+keeps only the first (newest) version of each user key, and **drops
+tombstones** — safe specifically because a full merge means no older,
+shadowed version of that key can exist in any *other* table afterward.
+
+## Trigger
+
+Compaction runs automatically once the SSTable count exceeds a fixed
+threshold (4 tables) after a flush, and can also be invoked directly via
+`Engine::compact()`. Phase 1 ships **full compaction** — merge everything
+into one table — rather than leveled compaction with size tiers; the LSM
+plan explicitly scopes leveling and bloom-parameter tuning as a follow-up
+once the minimal-correct engine is chaos-tested.
+
+## Atomicity
+
+A compaction that gets interrupted partway through must never leave the
+engine in a state where data silently disappears. cairn writes the merged
+output to a new file, only swaps it into the live `sstables` list after it's
+fully durable on disk, and only then removes the old input files — the same
+temp-write-then-rename discipline used for a single flush. Full rationale:
+[Atomic flush via temp+rename](/docs/decisions/atomic-flush).
+
+## What the tests pin down
+
+- `compaction_keeps_newest_and_drops_tombstones` — after compacting a key
+  written twice and another key that was deleted, only the newest value and
+  zero tombstones survive, and exactly one SSTable remains on disk.
+- `data_survives_compaction_and_reopen` — ten keys, each flushed
+  individually then compacted, all still read back correctly after the
+  engine is closed and reopened — proving compaction output is exactly as
+  durable and recoverable as an unflushed WAL write.
+- The property test (`engine_matches_btreemap`) interleaves `Put`, `Delete`,
+  `Flush`, and `Compact` operations in random order against a reference
+  `BTreeMap` and asserts every `Get` agrees — compaction is exercised as
+  just another operation in that sequence, not a special case.

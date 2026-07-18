@@ -1,0 +1,79 @@
+---
+title: Roadmap
+description: The phased delivery plan, with honest status per phase.
+---
+
+## Sequencing principle
+
+Every phase ends at a **finished, demoable, benchmarked, chaos-tested**
+system. If work stops after any phase, the result is a complete smaller
+system, never a broken half of a larger one. The source spec groups the LSM
+engine and Raft consensus as one delivery cycle ("Phase 1"); this page
+splits them into their own rows because they're independently large and at
+different points of completion right now.
+
+## Status
+
+| # | Deliverable | Status | Finished-state demo |
+| --- | --- | --- | --- |
+| 1 | Custom LSM storage engine | **Shipped** | Durable, crash-recoverable local KV store — 32 tests passing |
+| 2 | Raft consensus (single group) | **In design** | Design spec + log-store implementation plan drafted; log store is the next buildable unit |
+| 3 | MVCC transactions | Planned | Snapshot-isolation transactions, checker-proven |
+| 4 | Multi-Raft (many groups) | Planned | Many key ranges, per-group consensus |
+| 5 | Shard router + control plane | Planned | Live sharded cluster, visualized, fault-tested |
+
+## Phase 1 — Custom LSM storage engine (shipped)
+
+`crates/storage` (`cairn-storage`): append-only WAL with checksummed,
+crash-tolerant replay; an ordered memtable; immutable SSTables with a
+footer index; per-table bloom filters; full compaction that drops shadowed
+versions and tombstones. 32 tests passing, including a property test against
+a `BTreeMap` reference model and explicit crash-recovery integration tests.
+See [LSM Storage Engine](/docs/lsm-engine) for internals and
+[Benchmarks](/docs/benchmarks) for real numbers.
+
+## Phase 2 — Raft consensus (in design)
+
+Full single-group Raft in one cycle: leader election with pre-vote, log
+replication, a commit index, linearizable reads via read-index, log
+persistence, snapshotting/log compaction, and joint-consensus membership
+changes. The design spec resolved the open forks — real TCP transport
+behind a `Transport` trait (so a deterministic in-memory transport can drive
+tests), and a **dedicated Raft log store** rather than reusing the LSM
+engine (see [Raft-over-Paxos](/docs/decisions/raft-over-paxos) for why Raft
+was chosen, and the log-store note in
+[LSM-over-B-tree](/docs/decisions/lsm-over-btree) for why the log isn't
+just another LSM consumer). The first buildable unit — the log store itself
+— has an implementation plan drafted and is the next thing to ship.
+
+## Phase 3 — MVCC transactions
+
+Multi-key transactions at snapshot isolation, layered on Raft's commit
+ordering for a timestamp/version source: `begin()`, `txn.get/put`,
+`txn.commit() → ok | conflict`. Garbage collection of obsolete versions
+folds into the existing compaction path. Cross-shard transactions are
+explicitly deferred past this phase — the initial guarantee set is
+single-group.
+
+## Phase 4 — Multi-Raft
+
+Many independent Raft groups on the same node set, each owning a contiguous
+key range. Deliberately sequenced after Phases 1–3 are fully finished and
+chaos-tested, so sharding can't destabilize a proven single-group base.
+
+## Phase 5 — Shard router + control plane
+
+The one language boundary in the system: a TypeScript/Bun control plane
+that decides shard placement, routes client keys to the right Raft group,
+triggers splits/rebalances, and renders a live dashboard of shard map and
+per-group leadership.
+
+## Testing centerpiece: the chaos suite
+
+Not a phase of its own — it's the thread that runs through Phases 2–4.
+Deterministic, seeded multi-node simulation catches most consensus bugs
+before real sockets are involved; a Jepsen-style chaos harness then injects
+partitions, drops, delays, reorders, crashes, and clock skew against a real
+cluster and checks the resulting history for linearizability and snapshot
+isolation violations. That checker output, committed as evidence, is the
+actual deliverable — proving the guarantees, not asserting them.

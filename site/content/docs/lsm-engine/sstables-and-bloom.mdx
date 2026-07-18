@@ -1,0 +1,48 @@
+---
+title: SSTables & Bloom Filters
+description: Immutable on-disk tables, their footer index, and the bloom filter that short-circuits absent-key lookups.
+---
+
+## SSTable layout
+
+An SSTable is a flushed, immutable, sorted snapshot of the memtable at flush
+time. On disk it's a sequence of length-prefixed entries followed by a
+footer:
+
+```text
+entry:  [u32 klen][key][u64 seqno][u8 has_value][u32 vlen?][value?]
+footer: [u64 index_offset][u64 bloom_offset][u64 num_entries]["CAIRNSST"]
+```
+
+The footer is read first (seek to the end, read backwards) to locate the
+index and bloom filter without scanning the whole file. The index is a full
+`(user_key, seqno, file_offset)` list — deliberately simple over a block
+index, in keeping with "build the minimal correct engine first, optimize
+after it's chaos-tested."
+
+## Bloom filter
+
+Every SSTable carries a bloom filter over its user keys, built with
+double-hashing (two independent FNV-1a seeds combined to simulate *k* hash
+functions rather than computing *k* real ones). `SsTableReader::get` checks
+the bloom **before** touching the entry data:
+
+```rust
+if !self.bloom.contains(user_key) {
+    return Ok(None); // provably absent from this table — skip it
+}
+```
+
+A bloom filter has no false negatives by construction — if a key was
+inserted, `contains` always returns `true` for it — so this is always safe:
+the only cost of a false positive is a wasted lookup, never a wrong answer.
+For a point read that touches several SSTables, this is what keeps a cold
+lookup fast: most tables get skipped in O(1) instead of scanned.
+
+## Reading across tables
+
+`Engine::get` checks the memtable, then every SSTable **newest-first**, and
+returns the first hit — value or tombstone. That ordering is what
+`newer_memtable_shadows_flushed_sstable` and the newest-table-wins tests
+pin down: a key written after a flush always shadows the flushed copy, even
+though both technically "contain" the key.

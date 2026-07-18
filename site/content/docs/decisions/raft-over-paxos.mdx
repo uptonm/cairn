@@ -1,0 +1,61 @@
+---
+title: Raft over Paxos
+description: Why consensus is Raft, not Paxos or a Paxos variant.
+---
+
+## Decision
+
+cairn's replication layer is Raft: leader election with pre-vote, log
+replication with a commit index, read-index for linearizable reads,
+snapshot-based log compaction, and joint-consensus membership changes. See
+[Architecture](/docs/architecture) for where it sits in the stack and
+[Roadmap](/docs/roadmap) for its current status.
+
+## Why Raft
+
+Raft's explicit design goal is understandability, achieved by decomposing
+consensus into (mostly) independent subproblems — leader election, log
+replication, and safety — each with a crisp, checkable invariant:
+
+- **Election safety** — at most one leader per term.
+- **Log matching** — if two logs share an entry at the same index and term,
+  the logs are identical up through that index.
+- **Leader completeness** — a committed entry is present in the log of
+  every future leader.
+- **State-machine safety** — no two nodes apply different commands at the
+  same log index.
+
+Those four properties are exactly what a chaos/Jepsen-style test suite
+needs to state as assertions and check against a captured history. A
+protocol whose safety argument is legible enough to state as a short
+invariant list is also a protocol whose test suite can be built to actually
+prove those invariants — as opposed to a protocol where correctness lives
+in the aggregate behavior of a more subtle proof.
+
+## Why not Paxos
+
+Multi-Paxos achieves the same fault-tolerance properties but is
+notoriously under-specified for real systems: the base protocol describes
+single-value consensus, and every production system building a replicated
+log on top of it (multi-Paxos, the various leader-lease and log-shipping
+extensions) ends up re-deriving a Raft-shaped leader-based log replication
+scheme on top of Paxos's core — without Raft's benefit of having that
+scheme be part of the original, peer-reviewed specification. For a project
+where the deliverable is *proving* consensus correctness under adversarial
+scheduling, starting from a protocol whose replicated-log behavior is
+already fully specified — rather than an implementation-specific extension
+of a single-value primitive — removes an entire axis of "is this actually
+equivalent to what the literature proved" risk.
+
+## What this bought downstream
+
+A dedicated Raft log store (index-addressed entries, suffix truncation on
+conflict, snapshot-driven prefix compaction) as the first buildable unit,
+a `Transport` trait seam that both the real TCP implementation and a
+deterministic in-memory transport can satisfy, and a core `RaftCore` step
+function that is pure and I/O-free by design — the property that makes
+deterministic, seeded multi-node simulation possible at all. All three of
+those design choices are more naturally expressed against Raft's explicit
+role/RPC model (Follower/Candidate/Leader; RequestVote/AppendEntries/
+InstallSnapshot) than against a Paxos variant's more implementation-specific
+shape.

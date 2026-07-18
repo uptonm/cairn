@@ -1,0 +1,74 @@
+---
+title: Overview
+description: The shipped Phase 1 storage engine — architecture, crate layout, and constraints.
+---
+
+## Status: shipped
+
+The LSM (log-structured merge-tree) engine is Phase 1 of cairn and is
+**merged and tested** — `crates/storage` (package `cairn-storage`). It is the
+bottom layer every later phase (Raft, MVCC, sharding) builds on, and it
+already stands alone as a durable, crash-recoverable, ordered key-value
+store with **32 tests passing** (unit, integration, and property-based)
+across 8 modules.
+
+## Why an LSM tree, not a B-tree
+
+Writes go to an append-only log and an in-memory sorted structure first, and
+disk layout is rebuilt in the background by compaction, rather than mutated
+in place on every write. That trade is the core of an LSM: it turns random
+writes into sequential ones and defers the cost of tidy on-disk layout to a
+background process instead of paying it inline on the write path. The full
+tradeoff writeup, including where a B-tree would have been the better
+choice, is in [LSM-over-B-tree](/docs/decisions/lsm-over-btree).
+
+## Write path
+
+```text
+put(key, value) ──▶ WAL.append (fsync) ──▶ Memtable.insert
+```
+
+A write is only acknowledged once it is fsync'd to the write-ahead log —
+that's what makes it durable before it ever reaches disk-resident structure.
+The memtable is an in-memory ordered map (`BTreeMap<InternalKey, Option<Vec<u8>>>`)
+keyed by an `InternalKey { user_key, seqno }` that sorts ascending by
+`user_key`, then **descending** by `seqno` — so the newest version of a key
+is always the first thing a lookup finds within that key's run.
+
+## Read path
+
+Reads check the memtable first, then SSTables **newest-first**, and return
+the first version found — respecting tombstones (a `None` value marks a
+deletion and shadows anything older). A per-SSTable bloom filter lets the
+engine skip opening a table entirely when it can prove a key isn't there,
+which is where most of the point-read latency budget goes on a cold lookup.
+
+## Crate constraints
+
+These aren't style preferences — they're load-bearing for a storage engine
+that later layers trust to be crash-safe:
+
+- **No `unsafe`.**
+- **No `.unwrap()` / `.expect()`** in library code paths that handle I/O or
+  untrusted on-disk bytes — every fallible path returns `Result` with the
+  crate's own error type (`Io`, `Corruption`).
+- **Every SSTable and WAL record is checksummed** (CRC32); a checksum
+  mismatch on read is a recoverable error, never a panic.
+- **Sequence numbers never reuse.** `Seqno` is a `u64`, monotonically
+  increasing per engine, recovered correctly across restarts even when the
+  newest writes are sitting in SSTables rather than the WAL — see
+  [Seqno recovery](/docs/decisions/seqno-recovery).
+
+## Module map
+
+| Module | Responsibility |
+| --- | --- |
+| [`wal`](/docs/lsm-engine/wal) | Append-only, checksummed write-ahead log with crash-tolerant replay |
+| [`memtable`](/docs/lsm-engine/memtable) | In-memory ordered map, the write buffer ahead of a flush |
+| [`sstables-and-bloom`](/docs/lsm-engine/sstables-and-bloom) | Immutable on-disk tables plus per-table bloom filters |
+| [`compaction`](/docs/lsm-engine/compaction) | Background merge that reclaims space and drops shadowed versions |
+
+Interface surface exposed by `Engine`: `open`, `put`, `delete`, `get`,
+`flush`, `compact`. Range `scan()` and `snapshot()/restore()` are deliberately
+deferred to the Raft-integration plan, where the state machine actually needs
+them — noted in the original plan so the follow-on work doesn't lose it.

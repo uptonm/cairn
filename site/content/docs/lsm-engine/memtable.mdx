@@ -1,0 +1,46 @@
+---
+title: Memtable
+description: The in-memory, seqno-ordered write buffer ahead of a flush.
+---
+
+## Structure
+
+The memtable is a `BTreeMap<InternalKey, Option<Vec<u8>>>`. `InternalKey`
+carries both the user key and the write's sequence number, with an `Ord`
+implementation that sorts ascending by `user_key` and **descending** by
+`seqno` — so for any given key, every version is grouped together with the
+newest one first:
+
+```rust
+impl Ord for InternalKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.user_key
+            .cmp(&other.user_key)
+            .then(other.seqno.cmp(&self.seqno)) // newer seqno sorts first
+    }
+}
+```
+
+That ordering is what makes `get` a single `range(...).next()` lookup instead
+of a scan: seek to `(user_key, Seqno::MAX)` and take the first entry — it's
+either the newest version of that key or the wrong key entirely.
+
+## Tombstones
+
+A delete is represented as `Some(user_key) → None`, not a removed map entry.
+That distinction matters: a tombstone has to be visible in an *older*
+SSTable's shadow so a stale value underneath it doesn't resurrect on read.
+`get` therefore returns three states, not two — `None` (key never seen),
+`Some(None)` (deleted), `Some(Some(v))` (live value) — and callers flatten
+that only at the top of the public `Engine::get` API.
+
+## Flush trigger
+
+The engine tracks `approx_size_bytes()` (key + value + a fixed per-entry
+overhead) and triggers a flush once the memtable crosses a fixed threshold
+(4 MiB). A flush is atomic from the reader's point of view: entries are
+written out to a new SSTable in sorted order, the SSTable is registered
+before the memtable is cleared, and the WAL is rotated only after that —
+see [Compaction](/docs/lsm-engine/compaction) for how flushed SSTables are
+later merged, and [atomic flush via temp+rename](/docs/decisions/atomic-flush)
+for how a flush avoids ever exposing a half-written file to a reader.

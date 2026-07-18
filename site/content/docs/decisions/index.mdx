@@ -1,0 +1,20 @@
+---
+title: Overview
+description: ADR-style writeups of the tradeoffs that shaped cairn.
+---
+
+Each of these is a short architecture decision record: the choice made, the
+alternative(s) seriously considered, and why the tradeoff went the way it
+did. They're written from the actual design specs and implementation plans
+in the repo, not reconstructed after the fact.
+
+- **[Raft over Paxos](/docs/decisions/raft-over-paxos)** — why consensus is
+  Raft, not Paxos or a Paxos variant.
+- **[LSM over B-tree](/docs/decisions/lsm-over-btree)** — why the storage
+  engine is log-structured, and why the Raft log store is a separate
+  component rather than another LSM consumer.
+- **[Atomic flush via temp+rename](/docs/decisions/atomic-flush)** — how a
+  memtable flush or compaction avoids ever exposing a partially-written
+  SSTable to a reader.
+- **[Seqno recovery](/docs/decisions/seqno-recovery)** — why sequence
+  numbers must recover from SSTables, not just the WAL, on restart.

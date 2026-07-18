@@ -1,0 +1,62 @@
+---
+title: Seqno recovery
+description: A property test found a real bug — sequence numbers reset on reopen unless every SSTable is scanned too.
+---
+
+## The bug
+
+`Engine::open` derived `next_seqno` by replaying the WAL and taking the max
+seqno seen, plus one. That's correct until a flush happens: `flush()` empties
+the WAL once its contents are safely inside a new SSTable, because
+durability now lives in the SSTable, not the log. But that also means the
+seqnos of everything that was ever flushed are no longer visible to
+WAL-only replay.
+
+Concretely: open the engine, `put` a key, `flush()`, close, reopen. The WAL
+is empty, so `next_seqno` resets to `0` — even though the flushed SSTable on
+disk holds an entry at, say, `seqno = 1`. The next write after reopen reuses
+`seqno = 0`. Because `InternalKey` ordering treats a *lower* seqno as
+*older*, that reused-seqno write silently loses to the stale pre-reopen
+value once compaction merges them — a write that should have won instead
+vanishes, and old data resurrects.
+
+## How it was found
+
+Not by inspection — by the differential property test. `tests/model.rs`
+runs randomized sequences of `Put`/`Delete`/`Get`/`Flush`/`Compact` against
+both the real `Engine` and a reference `BTreeMap`, asserting every `Get`
+agrees. Adding a `Reopen` operation to that operation set (drop the engine,
+`Engine::open` the same directory again, keep going) turned this into a
+reliably-reproducible failure: random sequences that happened to flush then
+write again after a reopen would diverge from the model. This is exactly
+what the [architecture](/docs/architecture) testing strategy means by
+property tests catching what inspection misses.
+
+## The fix
+
+`Engine::open` now scans every loaded SSTable's entries in addition to WAL
+replay, and folds the max seqno found — from *either* source — into
+`next_seqno`:
+
+```rust
+for (_, sst) in &sstables {
+    for (ik, _) in sst.iter()? {
+        next_seqno = next_seqno.max(ik.seqno + 1);
+    }
+}
+```
+
+A dedicated regression test encodes the exact repro (flush a key, reopen,
+write the same key again, compact, assert the new write wins) so this can't
+silently regress, and the `Reopen` proptest operation stays in the random
+op set permanently — reopen-then-get consistency is now something every
+property-test run exercises, not a one-off check.
+
+## Why this matters beyond Phase 1
+
+Sequence numbers are the ordering primitive the MVCC layer (Phase 3) will
+build multi-version keys on top of, and the ordering Raft's replicated log
+will thread through the state machine. A seqno-reuse bug here wouldn't have
+stayed contained to the storage engine — it would have surfaced as silent
+data resurrection anywhere downstream that trusts "higher seqno always
+means newer."

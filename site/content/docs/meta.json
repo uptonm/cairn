@@ -1,0 +1,11 @@
+{
+  "title": "Docs",
+  "pages": [
+    "index",
+    "architecture",
+    "lsm-engine",
+    "roadmap",
+    "decisions",
+    "benchmarks"
+  ]
+}

@@ -1,0 +1,129 @@
+---
+title: Architecture
+description: The layered design — LSM engine, Raft, MVCC, multi-Raft, and the shard router — and how a linearizable write moves through it.
+---
+
+## Layered, built strictly bottom-up
+
+Every layer has one purpose and a narrow interface to the layer above, so it
+can be built and tested in isolation. If work stops after any phase, the
+result is a complete, smaller system — never a broken half of a larger one.
+
+```text
+        ┌───────────────────────────────────────────────┐
+        │  Control plane / shard router  (TS/Bun)        │  Phase 5
+        │  placement · split/rebalance · cluster dashboard│
+        └───────────────┬───────────────────────────────┘
+                        │ routes keys → groups
+   ┌────────────────────┼────────────────────┐
+   ▼                    ▼                     ▼
+┌─────────┐        ┌─────────┐          ┌─────────┐
+│ Raft grp│        │ Raft grp│   ...    │ Raft grp│         Phase 4 (multi-Raft)
+└────┬────┘        └────┬────┘          └────┬────┘
+     ▼  each replica hosts, per group:
+┌──────────────────────────────────────────────────┐
+│  MVCC transaction layer  (Rust)                   │        Phase 3
+├──────────────────────────────────────────────────┤
+│  Raft consensus  (Rust)                           │        Phase 2
+│  election · replication · read-index · snapshot · membership
+├──────────────────────────────────────────────────┤
+│  Custom LSM storage engine  (Rust)                │        Phase 1 — shipped
+│  WAL · memtable · SSTables · leveled compaction · bloom
+└──────────────────────────────────────────────────┘
+```
+
+See [Roadmap](/docs/roadmap) for status per phase — the diagram above orders
+layers by dependency, not delivery date; the source spec groups the LSM
+engine and Raft consensus together as the first cycle of work.
+
+## Components
+
+### 1. LSM storage engine (Rust) — shipped
+
+Durable, ordered, local key→value storage with point lookups (range scans
+land with the Raft state-machine integration). An append-only WAL (fsync on
+commit) feeds an in-memory memtable; the memtable flushes to immutable
+SSTables; leveled compaction reclaims space and drops obsolete versions;
+per-SSTable bloom filters short-circuit misses. Sequence numbers thread
+through every write so the future MVCC layer can store multiple versions per
+key. Depends on the filesystem only. Full internals: [LSM Storage
+Engine](/docs/lsm-engine).
+
+### 2. Raft consensus (Rust)
+
+Replicates a log of commands across a group so every replica applies the
+same commands in the same order, tolerating a minority of node failures.
+Leader election with pre-vote, log replication with a commit index,
+read-index for linearizable reads without a log write, log compaction via
+storage-engine snapshots, and joint-consensus membership changes. Depends on
+a dedicated Raft log store (append-oriented, index-keyed — not the LSM KV
+engine; see [Raft-over-Paxos](/docs/decisions/raft-over-paxos) and
+[log-store vs. LSM reuse](/docs/decisions/lsm-over-btree)) and a pluggable
+transport trait so a deterministic in-memory implementation can drive
+multi-node simulation in tests.
+
+### 3. Transport / RPC (Rust)
+
+Node-to-node messaging for Raft (AppendEntries, RequestVote, snapshots) and
+client request routing. Async send/receive of typed messages, pluggable so
+the chaos harness can inject partitions, drops, delays, and reordering.
+Transport is kept deliberately dumb — length-prefixed messages over TCP —
+because the pluggable seam exists for the chaos harness, not for production
+networking features.
+
+### 4. MVCC transaction layer (Rust)
+
+Multi-key transactions at snapshot isolation: `begin() → txn`, `txn.get/put`,
+`txn.commit() → ok | conflict`. Multi-version keys keyed by `(key, version)`,
+a timestamp/version source ordered through the Raft log, snapshot-isolation
+conflict checks at commit, and garbage collection of obsolete versions during
+compaction. Depends on the LSM engine's versioned keys and Raft's commit
+ordering.
+
+### 5. Multi-Raft (Rust)
+
+Runs many independent Raft groups on the same node set, each owning a
+contiguous key range (a shard). One Raft instance per range, a shared
+heartbeat/transport, and per-group storage namespaced within the engine.
+Sharding is deliberately sequenced *after* Phases 1–3 are fully finished and
+chaos-tested, so it cannot destabilize a proven base.
+
+### 6. Control plane + shard router (TS/Bun)
+
+Decides which node hosts which shard, routes client keys to the right group,
+triggers splits/rebalances, and exposes cluster state. A client-facing KV/txn
+API, an admin API, and a live dashboard visualizing the shard map and
+per-group Raft leadership. This is the one deliberate language boundary in
+the system: everything below it is Rust; the router, control plane, and
+dashboard are TypeScript/Bun.
+
+## Data flow — a linearizable write (single group)
+
+1. Client sends `put(k, v)` to the router; the router maps `k` to its Raft
+   group and forwards to that group's leader.
+2. The leader appends the command to its Raft log and replicates it via
+   AppendEntries.
+3. A majority persists the entry (WAL fsync in the storage engine) and acks.
+4. The leader advances its commit index and applies the command to the state
+   machine — MVCC/LSM `put(k, v, version)`.
+5. The leader acks the client. A subsequent linearizable read uses
+   read-index to confirm leadership before serving from applied state.
+
+## Testing strategy
+
+The differentiator between "senior architect" and "ambitious junior" is
+*proving* the guarantees, not asserting them:
+
+- **Unit + property tests** per layer — the LSM engine is checked against a
+  reference `BTreeMap` model under randomized operation sequences.
+- **Deterministic simulation** of a cluster — a single-threaded, seeded
+  scheduler drives multiple Raft nodes over the pluggable transport so runs
+  are reproducible. Most consensus bugs get caught here, not in a live
+  cluster.
+- **Chaos / Jepsen-style suite** (the flagship deliverable) — inject network
+  partitions, message drop/delay/reorder, node crashes and restarts, and
+  clock skew while a workload runs; check the resulting history against a
+  linearizability checker to prove the guarantees actually hold.
+- **Benchmarks** — storage-engine throughput/latency, with before/after
+  numbers when a compaction or memory optimization lands. See
+  [Benchmarks](/docs/benchmarks).
