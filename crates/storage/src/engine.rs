@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::memtable::Memtable;
 use crate::sstable::{SsTableReader, SsTableWriter};
-use crate::types::Seqno;
+use crate::types::{InternalKey, Seqno};
 use crate::wal::WalWriter;
 use std::path::{Path, PathBuf};
 
@@ -130,7 +130,7 @@ impl Engine {
         // Merge every table's entries; entries per table are already sorted
         // newest-first within a key. Collect, sort by InternalKey, then keep
         // the first (newest) version seen per user_key and drop tombstones.
-        let mut all: Vec<(crate::types::InternalKey, Option<Vec<u8>>)> = Vec::new();
+        let mut all: Vec<(InternalKey, Option<Vec<u8>>)> = Vec::new();
         for (_, sst) in &self.sstables {
             all.extend(sst.iter()?);
         }
@@ -138,8 +138,9 @@ impl Engine {
 
         let id = self.next_sst_id;
         self.next_sst_id += 1;
-        let path = self.dir.join(format!("{id:06}.sst"));
-        let mut w = SsTableWriter::create(&path)?;
+        let final_path = self.dir.join(format!("{id:06}.sst"));
+        let tmp_path = self.dir.join(format!("{id:06}.sst.tmp"));
+        let mut w = SsTableWriter::create(&tmp_path)?;
         let mut last_key: Option<Vec<u8>> = None;
         for (ik, value) in all {
             if last_key.as_deref() == Some(ik.user_key.as_slice()) {
@@ -152,11 +153,26 @@ impl Engine {
             w.add(&ik, &value)?;
         }
         w.finish()?;
+        // Atomically publish, same as flush(): a discoverable `.sst` is only
+        // ever a complete file, since rename is atomic on POSIX. A crash
+        // before this point leaves only an orphaned `.sst.tmp`, which
+        // discovery ignores, so the store is never left with a truncated
+        // compacted table.
+        std::fs::rename(&tmp_path, &final_path)?;
 
         let old_ids: Vec<u64> = self.sstables.iter().map(|(id, _)| *id).collect();
-        self.sstables = vec![(id, SsTableReader::open(&path)?)];
+        self.sstables = vec![(id, SsTableReader::open(&final_path)?)];
         for old in old_ids {
-            let _ = std::fs::remove_file(self.dir.join(format!("{old:06}.sst")));
+            // Propagate failures instead of swallowing them: a surviving old
+            // table has a lower id, so it sorts after the new compacted
+            // table, and a key whose newest version was a tombstone (and so
+            // is absent from the compacted table) would fall through to the
+            // stale value in that orphan and appear to un-delete. Fully
+            // crash-atomic multi-file replacement (i.e. surviving a crash
+            // between the rename above and these deletes) needs an on-disk
+            // manifest of live SSTables; that's out of scope here and is
+            // tracked for a later hardening/chaos-testing task.
+            std::fs::remove_file(self.dir.join(format!("{old:06}.sst")))?;
         }
         Ok(())
     }
@@ -282,5 +298,24 @@ mod tests {
         for i in 0..10u8 {
             assert_eq!(e.get(&[i]).unwrap(), Some(vec![i, i]));
         }
+    }
+
+    #[test]
+    fn deleted_key_stays_absent_after_compaction_and_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut e = Engine::open(dir.path()).unwrap();
+            e.put(b"a", b"1").unwrap();
+            e.flush().unwrap();
+            e.put(b"b", b"keep").unwrap();
+            e.flush().unwrap();
+            e.delete(b"a").unwrap();
+            e.flush().unwrap();
+
+            e.compact().unwrap();
+        }
+        let e = Engine::open(dir.path()).unwrap();
+        assert_eq!(e.get(b"a").unwrap(), None);
+        assert_eq!(e.get(b"b").unwrap(), Some(b"keep".to_vec()));
     }
 }
