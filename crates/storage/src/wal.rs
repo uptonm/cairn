@@ -122,6 +122,7 @@ fn read_full_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<Option<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom};
     use tempfile::tempdir;
 
     #[test]
@@ -153,6 +154,64 @@ mod tests {
         // Simulate a crash mid-write: append 3 garbage bytes.
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(&[0xAB, 0xCD, 0xEF]).unwrap();
+        drop(f);
+
+        let records = WalWriter::read_all(&path).unwrap();
+        assert_eq!(records, vec![(1, b"a".to_vec(), Some(b"1".to_vec()))]);
+    }
+
+    #[test]
+    fn crc_mismatch_on_complete_body_drops_record_and_keeps_prefix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut w = WalWriter::create(&path).unwrap();
+        w.append(1, b"a", Some(b"1")).unwrap();
+        let len_after_first = std::fs::metadata(&path).unwrap().len();
+        w.append(100, b"second-key", Some(b"second-value")).unwrap();
+        let len_after_second = std::fs::metadata(&path).unwrap().len();
+        drop(w);
+
+        // Flip a byte well inside the second record's body (past its 4-byte
+        // CRC prefix), simulating bit-flip corruption of a fully-written
+        // record rather than a truncated one.
+        let second_record_len = len_after_second - len_after_first;
+        assert!(
+            second_record_len > 10,
+            "test record too short to corrupt safely"
+        );
+        let flip_offset = len_after_first + 4 + second_record_len / 2;
+
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        f.seek(SeekFrom::Start(flip_offset)).unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).unwrap();
+        f.seek(SeekFrom::Start(flip_offset)).unwrap();
+        f.write_all(&[byte[0] ^ 0xFF]).unwrap();
+        drop(f);
+
+        let records = WalWriter::read_all(&path).unwrap();
+        assert_eq!(records, vec![(1, b"a".to_vec(), Some(b"1".to_vec()))]);
+    }
+
+    #[test]
+    fn truncation_mid_record_keeps_prior_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut w = WalWriter::create(&path).unwrap();
+        w.append(1, b"a", Some(b"1")).unwrap();
+        let len_after_first = std::fs::metadata(&path).unwrap().len();
+        w.append(2, b"second-key", Some(b"second-value")).unwrap();
+        drop(w);
+
+        // Truncate partway into the second record: past its 4-byte CRC
+        // prefix but before its seqno/key/value body is fully written,
+        // simulating a crash mid-write of the second record.
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(len_after_first + 6).unwrap();
         drop(f);
 
         let records = WalWriter::read_all(&path).unwrap();
