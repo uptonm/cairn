@@ -1,26 +1,42 @@
 use super::Transport;
 use crate::{Message, NodeId};
+use bincode::Options;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, RwLock};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::task::{JoinHandle, JoinSet};
 
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const INBOUND_CHANNEL_CAPACITY: usize = 256;
+const MAX_INBOUND_CONNECTIONS: usize = 32;
+const INITIAL_ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
+const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 
-type WriterSlot = Arc<Mutex<Option<OwnedWriteHalf>>>;
+struct CachedWriter {
+    peer_addr: SocketAddr,
+    writer: OwnedWriteHalf,
+}
+
+struct EncodedFrame {
+    length: [u8; 4],
+    payload: Vec<u8>,
+}
+
+type WriterSlot = Arc<Mutex<Option<CachedWriter>>>;
 
 pub struct TcpTransport {
     node_id: NodeId,
     local_addr: SocketAddr,
     peers: RwLock<HashMap<NodeId, SocketAddr>>,
     writers: Mutex<HashMap<NodeId, WriterSlot>>,
-    receiver: mpsc::UnboundedReceiver<(NodeId, Message)>,
-    accept_task: JoinHandle<()>,
+    receiver: mpsc::Receiver<(NodeId, Message)>,
+    shutdown: watch::Sender<bool>,
+    _accept_task: JoinHandle<()>,
 }
 
 impl TcpTransport {
@@ -31,8 +47,9 @@ impl TcpTransport {
     ) -> crate::Result<TcpTransport> {
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let accept_task = tokio::spawn(accept_connections(listener, sender));
+        let (sender, receiver) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
+        let (shutdown, shutdown_receiver) = watch::channel(false);
+        let accept_task = tokio::spawn(accept_connections(listener, sender, shutdown_receiver));
 
         Ok(TcpTransport {
             node_id,
@@ -40,7 +57,8 @@ impl TcpTransport {
             peers: RwLock::new(peers),
             writers: Mutex::new(HashMap::new()),
             receiver,
-            accept_task,
+            shutdown,
+            _accept_task: accept_task,
         })
     }
 
@@ -50,10 +68,6 @@ impl TcpTransport {
 
     pub async fn set_peer(&self, node_id: NodeId, addr: SocketAddr) {
         self.peers.write().await.insert(node_id, addr);
-        let writer = self.writers.lock().await.get(&node_id).cloned();
-        if let Some(writer) = writer {
-            *writer.lock().await = None;
-        }
     }
 
     async fn peer_addr(&self, node_id: NodeId) -> crate::Result<SocketAddr> {
@@ -83,7 +97,7 @@ impl TcpTransport {
 
 impl Drop for TcpTransport {
     fn drop(&mut self) {
-        self.accept_task.abort();
+        let _ = self.shutdown.send(true);
     }
 }
 
@@ -111,47 +125,41 @@ impl Transport for TcpTransport {
     }
 }
 
-fn encode_frame(message: &Message) -> crate::Result<Vec<u8>> {
+fn encode_frame(message: &Message) -> crate::Result<EncodedFrame> {
     let payload = bincode::serialize(message).map_err(|error| {
         crate::Error::Corruption(format!("message serialization failed: {error}"))
     })?;
-    if payload.len() > MAX_FRAME_SIZE {
-        return Err(crate::Error::Corruption(format!(
-            "message payload exceeds {MAX_FRAME_SIZE} byte frame limit"
-        )));
-    }
     let payload_len = u32::try_from(payload.len()).map_err(|_| {
         crate::Error::Corruption("message payload does not fit in a u32 frame length".to_string())
     })?;
-    let mut frame = Vec::with_capacity(payload.len() + 4);
-    frame.extend_from_slice(&payload_len.to_le_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
+    Ok(EncodedFrame {
+        length: payload_len.to_le_bytes(),
+        payload,
+    })
 }
 
 async fn write_frame_once(
-    writer: &mut Option<OwnedWriteHalf>,
+    writer_slot: &mut Option<CachedWriter>,
     node_id: NodeId,
     peer_addr: SocketAddr,
-    frame: &[u8],
+    frame: &EncodedFrame,
 ) -> crate::Result<()> {
-    if writer.is_none() {
-        *writer = Some(connect_writer(node_id, peer_addr).await?);
-    }
-
-    let result = match writer {
-        Some(writer) => writer.write_all(frame).await,
-        None => {
-            return Err(io_error(
-                ErrorKind::NotConnected,
-                format!("writer for peer {peer_addr} is unavailable"),
-            ))
-        }
+    let mut writer = match writer_slot.take() {
+        Some(cached) if cached.peer_addr == peer_addr => cached.writer,
+        Some(_) | None => connect_writer(node_id, peer_addr).await?,
     };
-    if result.is_err() {
-        *writer = None;
+    let result = async {
+        writer.write_all(&frame.length).await?;
+        writer.write_all(&frame.payload).await
     }
-    result.map_err(Into::into)
+    .await;
+    match result {
+        Ok(()) => {
+            *writer_slot = Some(CachedWriter { peer_addr, writer });
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn connect_writer(node_id: NodeId, peer_addr: SocketAddr) -> crate::Result<OwnedWriteHalf> {
@@ -163,24 +171,48 @@ async fn connect_writer(node_id: NodeId, peer_addr: SocketAddr) -> crate::Result
 
 async fn accept_connections(
     listener: TcpListener,
-    sender: mpsc::UnboundedSender<(NodeId, Message)>,
+    sender: mpsc::Sender<(NodeId, Message)>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut readers = JoinSet::new();
+    let mut accept_backoff = INITIAL_ACCEPT_BACKOFF;
+
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let sender = sender.clone();
-                tokio::spawn(async move {
-                    let _ = read_stream(stream, sender).await;
-                });
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            _ = readers.join_next(), if !readers.is_empty() => {}
+            accepted = listener.accept(), if readers.len() < MAX_INBOUND_CONNECTIONS => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        accept_backoff = INITIAL_ACCEPT_BACKOFF;
+                        let sender = sender.clone();
+                        readers.spawn(async move { read_stream(stream, sender).await });
+                    }
+                    Err(_) => {
+                        let delay = accept_backoff;
+                        accept_backoff =
+                            accept_backoff.saturating_mul(2).min(MAX_ACCEPT_BACKOFF);
+                        let shutdown_requested = tokio::select! {
+                            _ = tokio::time::sleep(delay) => false,
+                            _ = shutdown.changed() => true,
+                        };
+                        if shutdown_requested {
+                            break;
+                        }
+                    }
+                }
             }
-            Err(_) => tokio::task::yield_now().await,
         }
     }
+
+    readers.abort_all();
+    while readers.join_next().await.is_some() {}
 }
 
 async fn read_stream(
     mut stream: TcpStream,
-    sender: mpsc::UnboundedSender<(NodeId, Message)>,
+    sender: mpsc::Sender<(NodeId, Message)>,
 ) -> crate::Result<()> {
     let mut handshake = [0; 8];
     stream.read_exact(&mut handshake).await?;
@@ -190,18 +222,16 @@ async fn read_stream(
         let mut length = [0; 4];
         stream.read_exact(&mut length).await?;
         let payload_len = u32::from_le_bytes(length) as usize;
-        if payload_len > MAX_FRAME_SIZE {
-            return Err(crate::Error::Corruption(format!(
-                "incoming payload exceeds {MAX_FRAME_SIZE} byte frame limit"
-            )));
-        }
-
         let mut payload = vec![0; payload_len];
         stream.read_exact(&mut payload).await?;
-        let message = bincode::deserialize(&payload).map_err(|error| {
-            crate::Error::Corruption(format!("message deserialization failed: {error}"))
-        })?;
-        sender.send((source_id, message)).map_err(|_| {
+        let message = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .deserialize(&payload)
+            .map_err(|error| {
+                crate::Error::Corruption(format!("message deserialization failed: {error}"))
+            })?;
+        sender.send((source_id, message)).await.map_err(|_| {
             io_error(
                 ErrorKind::BrokenPipe,
                 "TCP transport inbound receiver is closed",
@@ -222,11 +252,28 @@ mod tests {
         AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, LogEntry,
         Message, RequestVoteReq, RequestVoteResp,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::net::SocketAddr;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    async fn write_raw_message(stream: &mut TcpStream, message: &Message) {
+        let payload = bincode::serialize(message).unwrap();
+        let length = u32::try_from(payload.len()).unwrap();
+        stream.write_all(&length.to_le_bytes()).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+    }
+
+    async fn read_raw_message(stream: &mut TcpStream) -> Message {
+        let mut length = [0; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut payload = vec![0; u32::from_le_bytes(length) as usize];
+        stream.read_exact(&mut payload).await.unwrap();
+        bincode::deserialize(&payload).unwrap()
+    }
 
     fn all_messages() -> Vec<Message> {
         vec![
@@ -396,23 +443,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_inbound_frame_closes_only_its_stream() {
+    async fn transports_snapshot_larger_than_previous_frame_limit() {
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut receiver = TcpTransport::bind(2, bind_addr, HashMap::new())
+            .await
+            .unwrap();
+        let sender = TcpTransport::bind(1, bind_addr, HashMap::from([(2, receiver.local_addr())]))
+            .await
+            .unwrap();
+        let expected = Message::InstallSnapshot(InstallSnapshotReq {
+            term: 29,
+            leader_id: 1,
+            last_index: 101,
+            last_term: 28,
+            data: vec![0x6b; 16 * 1024 * 1024],
+        });
+
+        sender.send(2, expected.clone()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap(),
+            Some((1, expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn trailing_bincode_bytes_close_only_the_malformed_stream() {
         let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let mut receiver = TcpTransport::bind(2, bind_addr, HashMap::new())
             .await
             .unwrap();
         let mut malformed = TcpStream::connect(receiver.local_addr()).await.unwrap();
         malformed.write_all(&99_u64.to_le_bytes()).await.unwrap();
+        let invalid = Message::InstallSnapshotResp(InstallSnapshotResp { term: 29 });
+        let mut payload = bincode::serialize(&invalid).unwrap();
+        payload.push(0xff);
         malformed
-            .write_all(&((super::MAX_FRAME_SIZE as u32) + 1).to_le_bytes())
+            .write_all(&u32::try_from(payload.len()).unwrap().to_le_bytes())
             .await
             .unwrap();
+        malformed.write_all(&payload).await.unwrap();
         drop(malformed);
 
         let sender = TcpTransport::bind(1, bind_addr, HashMap::from([(2, receiver.local_addr())]))
             .await
             .unwrap();
-        let expected = Message::InstallSnapshotResp(InstallSnapshotResp { term: 29 });
+        let expected = Message::InstallSnapshotResp(InstallSnapshotResp { term: 31 });
         sender.send(2, expected.clone()).await.unwrap();
 
         assert_eq!(
@@ -421,5 +498,223 @@ mod tests {
                 .unwrap(),
             Some((1, expected))
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_frame_write_forces_a_fresh_connection() {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let (handshake_seen, handshake_received) = oneshot::channel();
+        let (continue_first, continue_first_received) = oneshot::channel();
+        let raw_peer = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut handshake = [0; 8];
+            first.read_exact(&mut handshake).await.unwrap();
+            assert_eq!(handshake, 1_u64.to_le_bytes());
+            handshake_seen.send(()).unwrap();
+            continue_first_received.await.unwrap();
+
+            let mut discarded = Vec::new();
+            tokio::time::timeout(Duration::from_secs(1), first.read_to_end(&mut discarded))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.read_exact(&mut handshake).await.unwrap();
+            assert_eq!(handshake, 1_u64.to_le_bytes());
+            read_raw_message(&mut second).await
+        });
+
+        let transport = Arc::new(
+            TcpTransport::bind(
+                1,
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                HashMap::from([(2, peer_addr)]),
+            )
+            .await
+            .unwrap(),
+        );
+        let large = Message::InstallSnapshot(InstallSnapshotReq {
+            term: 37,
+            leader_id: 1,
+            last_index: 103,
+            last_term: 36,
+            data: vec![0x4c; 8 * 1024 * 1024],
+        });
+        let sending_transport = Arc::clone(&transport);
+        let send = tokio::spawn(async move { sending_transport.send(2, large).await });
+
+        handshake_received.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!send.is_finished(), "large frame write did not block");
+        send.abort();
+        assert!(send.await.unwrap_err().is_cancelled());
+        continue_first.send(()).unwrap();
+
+        let expected = Message::RequestVoteResp(RequestVoteResp {
+            term: 38,
+            vote_granted: true,
+        });
+        transport.send(2, expected.clone()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), raw_peer)
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_peer_update_cannot_reuse_the_old_address() {
+        let old_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let old_addr = old_listener.local_addr().unwrap();
+        let new_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let new_addr = new_listener.local_addr().unwrap();
+        let (old_received, first_old_message) = oneshot::channel();
+        let (release_old, release_old_received) = oneshot::channel();
+        let old_peer = tokio::spawn(async move {
+            let (mut stream, _) = old_listener.accept().await.unwrap();
+            let mut handshake = [0; 8];
+            stream.read_exact(&mut handshake).await.unwrap();
+            old_received
+                .send(read_raw_message(&mut stream).await)
+                .unwrap();
+            let _ = release_old_received.await;
+        });
+
+        let transport = Arc::new(
+            TcpTransport::bind(
+                1,
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                HashMap::from([(2, old_addr)]),
+            )
+            .await
+            .unwrap(),
+        );
+        let first = Message::RequestVoteResp(RequestVoteResp {
+            term: 41,
+            vote_granted: true,
+        });
+        transport.send(2, first.clone()).await.unwrap();
+        assert_eq!(first_old_message.await.unwrap(), first);
+
+        let writer = transport.writer_slot(2).await;
+        let writer_guard = writer.lock().await;
+        let updating_transport = Arc::clone(&transport);
+        let update = tokio::spawn(async move { updating_transport.set_peer(2, new_addr).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if transport.peer_addr(2).await.unwrap() == new_addr {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        update.abort();
+        let _ = update.await;
+        drop(writer_guard);
+
+        let new_peer = tokio::spawn(async move {
+            let (mut stream, _) = new_listener.accept().await.unwrap();
+            let mut handshake = [0; 8];
+            stream.read_exact(&mut handshake).await.unwrap();
+            read_raw_message(&mut stream).await
+        });
+        let expected = Message::RequestVoteResp(RequestVoteResp {
+            term: 42,
+            vote_granted: false,
+        });
+        transport.send(2, expected.clone()).await.unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(1), new_peer).await;
+        let _ = release_old.send(());
+        let _ = old_peer.await;
+
+        assert_eq!(delivered.unwrap().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn dropping_transport_closes_idle_inbound_reader() {
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut transport = TcpTransport::bind(2, bind_addr, HashMap::new())
+            .await
+            .unwrap();
+        let mut client = TcpStream::connect(transport.local_addr()).await.unwrap();
+        client.write_all(&1_u64.to_le_bytes()).await.unwrap();
+        let message = Message::InstallSnapshotResp(InstallSnapshotResp { term: 47 });
+        write_raw_message(&mut client, &message).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), transport.recv())
+                .await
+                .unwrap(),
+            Some((1, message))
+        );
+
+        drop(transport);
+        let mut byte = [0];
+        let closed = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "idle inbound socket remained open after transport drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounds_simultaneous_inbound_reader_tasks() {
+        const EXPECTED_MAX_CONNECTIONS: usize = 32;
+
+        let mut transport =
+            TcpTransport::bind(2, SocketAddr::from(([127, 0, 0, 1], 0)), HashMap::new())
+                .await
+                .unwrap();
+        let mut clients = Vec::new();
+        for offset in 0..=EXPECTED_MAX_CONNECTIONS {
+            let source_id = 100 + offset as u64;
+            let mut client = TcpStream::connect(transport.local_addr()).await.unwrap();
+            client.write_all(&source_id.to_le_bytes()).await.unwrap();
+            write_raw_message(
+                &mut client,
+                &Message::InstallSnapshotResp(InstallSnapshotResp { term: source_id }),
+            )
+            .await;
+            clients.push((source_id, client));
+        }
+
+        let mut received = HashSet::new();
+        for _ in 0..EXPECTED_MAX_CONNECTIONS {
+            let (source_id, _) = tokio::time::timeout(Duration::from_secs(1), transport.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            received.insert(source_id);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), transport.recv())
+                .await
+                .is_err(),
+            "listener admitted more than the bounded reader count"
+        );
+
+        let active = received.iter().next().copied().unwrap();
+        let active_index = clients
+            .iter()
+            .position(|(source_id, _)| *source_id == active)
+            .unwrap();
+        drop(clients.swap_remove(active_index));
+        let (final_source, _) = tokio::time::timeout(Duration::from_secs(1), transport.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(received.insert(final_source));
+        assert_eq!(received.len(), EXPECTED_MAX_CONNECTIONS + 1);
     }
 }
