@@ -194,6 +194,19 @@ impl<S: RaftStorage> RaftCore<S> {
         self.leader_id
     }
 
+    /// Consumes this core and returns its storage, discarding all volatile
+    /// state (role, leader_id, election/heartbeat timers, replication
+    /// tracking, pending reads, ...). This is the supported way to model a
+    /// process crash + restart: a real deployment loses everything except
+    /// what its `RaftStorage` impl actually persisted, and restarting means
+    /// constructing a fresh `RaftCore::new` over that same durable storage.
+    /// Minimal by design — it exposes no more than a caller already has
+    /// via `Config` + a persistent `S`, just lets it be recovered from a
+    /// live core instead of held onto separately from construction time.
+    pub fn into_storage(self) -> S {
+        self.storage
+    }
+
     /// Dispatch skeleton. `InstallSnapshot`/`InstallSnapshotResp` are
     /// permanently ignored here (snapshot install is out of RaftCore's
     /// scope).
