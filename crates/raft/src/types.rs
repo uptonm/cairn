@@ -1,8 +1,10 @@
+use serde_derive::{Deserialize, Serialize};
+
 pub type NodeId = u64;
 pub type Term = u64;
 pub type LogIndex = u64;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub term: Term,
     pub index: LogIndex,
