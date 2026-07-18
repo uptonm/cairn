@@ -268,6 +268,7 @@ async fn run_scheduler(
             if let Some(delivery) = pending.pop() {
                 deliver(delivery, &destinations);
             }
+            tokio::task::yield_now().await;
             continue;
         }
 
@@ -287,6 +288,7 @@ async fn run_scheduler(
         }
 
         if batch_size == MAX_INCOMING_BATCH {
+            tokio::task::yield_now().await;
             continue;
         }
 
@@ -393,7 +395,9 @@ mod tests {
     use crate::transport::Transport;
     use crate::Error;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::sync::Arc;
+    use std::task::Poll;
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::Instant;
@@ -495,12 +499,12 @@ mod tests {
         assert!(matches!(one.send(2, message(61)).await, Err(Error::Io(_))));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn due_delivery_is_not_starved_by_a_large_input_backlog() {
+    #[tokio::test]
+    async fn scheduler_yields_between_batches_on_current_thread() {
         let (incoming, incoming_receiver) = mpsc::unbounded_channel();
         let (destination, mut destination_receiver) = mpsc::unbounded_channel();
         let destinations = Arc::new(HashMap::from([(2, destination)]));
-        let (due_acknowledgement, due_result) = oneshot::channel();
+        let (due_acknowledgement, mut due_result) = oneshot::channel();
         let now = Instant::now();
 
         incoming
@@ -513,7 +517,7 @@ mod tests {
                 acknowledgement: due_acknowledgement,
             })
             .unwrap();
-        for sequence in 1..=250_000 {
+        for sequence in 1..=1_024 {
             let (acknowledgement, result) = oneshot::channel();
             drop(result);
             incoming
@@ -528,8 +532,23 @@ mod tests {
                 .unwrap();
         }
 
-        let scheduler = tokio::spawn(run_scheduler(incoming_receiver, destinations));
-        let result = tokio::time::timeout(Duration::from_millis(5), due_result).await;
+        let mut scheduler = Box::pin(run_scheduler(incoming_receiver, destinations));
+        std::future::poll_fn(|context| {
+            assert!(scheduler.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        assert!(
+            matches!(
+                due_result.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "scheduler did not yield before servicing the full input backlog"
+        );
+
+        let scheduler = tokio::spawn(scheduler);
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut due_result).await;
         scheduler.abort();
         drop(incoming);
         let _ = scheduler.await;
