@@ -1,0 +1,58 @@
+---
+title: Benchmarks
+description: Real numbers from the shipped LSM engine, and what they do and don't claim.
+---
+
+## Headline numbers
+
+Measured with [Criterion](https://github.com/bheisler/criterion.rs) against
+`crates/storage`'s `cargo bench -p cairn-storage`:
+
+- **~552µs per 1,000 sequential puts** — roughly **1.8M puts/sec** on a
+  single node, single thread, values held entirely in memory before a flush.
+- **~6.1µs cold point-read latency** — a `get` against a key that's been
+  flushed and compacted to disk (i.e., not sitting in the memtable), so the
+  measurement includes a bloom-filter check and an SSTable lookup, not just
+  a `BTreeMap` hit.
+
+## What these numbers are, precisely
+
+- **Microbenchmarks**, not a production SLA. They measure the storage
+  engine in isolation — no network, no Raft replication, no concurrent
+  client load.
+- **Single-node, single-thread.** There is no concurrency story yet; the
+  engine's public API takes `&mut self` for writes.
+- **Criterion's statistical methodology** (warm-up, multiple samples,
+  outlier detection) — these are stable estimates on the benchmark machine,
+  not a guarantee that will hold on different hardware.
+
+They're published because they're the honest baseline the roadmap's later
+phases (Raft replication, MVCC, sharding) will each be measured against —
+the point of a "before/after" number is having a real "before."
+
+## Test coverage by module
+
+Correctness, not speed, is what actually gates each phase. 32 tests pass
+across the engine's modules, plus a property-based test that runs hundreds
+of randomized `Put`/`Delete`/`Flush`/`Compact` sequences against a
+`BTreeMap` reference model and asserts every `Get` agrees:
+
+| Module | Tests |
+| --- | --- |
+| `engine` | 11 |
+| `bloom` | 5 |
+| `wal` | 4 |
+| `memtable` | 4 |
+| `sstable` | 3 |
+| `types` | 2 |
+| `recovery` (integration) | 2 |
+| `model` (property-based) | 1 (runs ~200 generated ops per execution) |
+
+## Reproducing these numbers
+
+```bash
+git clone https://github.com/uptonm/cairn
+cd cairn
+cargo test -p cairn-storage    # 32 tests
+cargo bench -p cairn-storage   # criterion benchmarks
+```

@@ -1,0 +1,44 @@
+---
+title: Write-Ahead Log
+description: Checksummed, append-only durability with crash-tolerant replay.
+---
+
+## Purpose
+
+Every `put`/`delete` is written to the WAL and fsync'd **before** it touches
+the memtable. This is the engine's actual durability boundary: if the
+process crashes the instant after a write is acknowledged, the WAL record is
+already on disk, and `Engine::open` replays it back into the memtable on the
+next start.
+
+## Record framing
+
+Each record is length- and checksum-framed so a reader can detect corruption
+and a torn tail without guessing:
+
+```text
+[u32 crc][u64 seqno][u32 klen][key][u8 has_value][u32 vlen][value]
+```
+
+little-endian throughout. `has_value == 0` encodes a tombstone (delete) and
+omits the value length/bytes entirely.
+
+## Crash-tolerant replay
+
+`WalWriter::read_all` reads records until it hits one of three things:
+end-of-file, a short/truncated record (a write that was interrupted
+mid-append), or a CRC mismatch. In every one of those cases it **stops
+cleanly and returns everything read so far** — it never panics and never
+fabricates a record from partial bytes. That's the property a torn-write
+crash test exercises directly: append a valid record, then append a few
+garbage bytes to simulate a crash mid-write, and confirm replay returns
+exactly the valid prefix.
+
+## Why this, not `mmap` or a WAL library
+
+The WAL is intentionally the simplest thing that gives correct durability
+semantics: `OpenOptions::append` plus `sync_all()` on every record. There's
+no group-commit batching and no async fsync — Phase 1's job was a *correct*
+engine first; write-amplification and fsync-batching tuning are explicitly
+deferred until after the engine is chaos-tested (see the risk fencing in the
+[architecture](/docs/architecture) testing strategy).

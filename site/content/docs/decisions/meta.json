@@ -1,0 +1,10 @@
+{
+  "title": "Design Decisions",
+  "pages": [
+    "index",
+    "raft-over-paxos",
+    "lsm-over-btree",
+    "atomic-flush",
+    "seqno-recovery"
+  ]
+}

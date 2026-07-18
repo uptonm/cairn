@@ -1,0 +1,59 @@
+---
+title: Introduction
+description: What cairn is, why it exists, and what "done" means for a portfolio distributed database.
+---
+
+## What cairn is
+
+cairn is a distributed key-value database built from scratch in Rust. It is a
+**portfolio flagship**, not a product — the goal is to demonstrate the ability
+to architect a large, genuinely hard system end to end: a custom storage
+engine, a real consensus protocol, multi-key transactions, and a sharded
+cluster with a control plane on top.
+
+The complexity here is intrinsic to the problem — consensus, storage-engine
+internals, transaction isolation, and shard placement — not a function of
+traffic volume. The bar is a working, benchmarked, adversarially-tested
+system with an architecture writeup that explains *why* each tradeoff was
+made, not just *what* was built.
+
+## Guarantees
+
+The test suite exists to prove these hold, not just assert them:
+
+- **Linearizable** reads and writes within a single key's Raft group.
+- **Snapshot isolation** for multi-key transactions via MVCC.
+- **Durability** — an acknowledged write survives a crash of the acking node
+  (WAL fsync + Raft commit on a majority).
+- **Availability** under a minority of node failures per group (Raft quorum).
+
+Cross-shard transactions are explicitly out of the guarantee set for the
+first cut — see [Roadmap](/docs/roadmap) and the
+[design decisions](/docs/decisions) for how that's fenced.
+
+## Non-goals
+
+- Serving third-party or production traffic. This runs locally or on a
+  homelab.
+- SQL. No parser, planner, or relational layer — the interface is a typed
+  KV + transaction API.
+- Multi-region / geo-replication, auth, or wire-compatibility with an
+  existing database.
+
+## How the docs are organized
+
+- **[Architecture](/docs/architecture)** — the layered system design and how
+  a write flows through it.
+- **[LSM Storage Engine](/docs/lsm-engine)** — internals of the Phase 1
+  engine: WAL, memtable, SSTables, bloom filters, compaction.
+- **[Roadmap](/docs/roadmap)** — phased delivery plan with honest status.
+- **[Design Decisions](/docs/decisions)** — ADR-style writeups of the
+  tradeoffs that shaped the system.
+- **[Benchmarks](/docs/benchmarks)** — real numbers from the shipped engine,
+  with methodology.
+
+## Source
+
+cairn is open source. The code, specs, and implementation plans this site is
+generated from live at
+[github.com/uptonm/cairn](https://github.com/uptonm/cairn).
