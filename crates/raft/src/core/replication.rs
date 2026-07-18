@@ -231,6 +231,10 @@ impl<S: RaftStorage> RaftCore<S> {
             }
             self.last_contact_tick.insert(from, self.tick_count);
             self.maybe_advance_commit()?;
+            // Fresh contact and/or a commit advance may have just satisfied
+            // a pending read's release conditions (core/read_index.rs) —
+            // release promptly rather than waiting for the next tick.
+            self.maybe_release_reads();
         } else {
             // The peer's log actually conflicts with what we assumed, so
             // every extent currently in flight to it is void — there's no

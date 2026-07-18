@@ -6,6 +6,7 @@ use crate::storage::RaftStorage;
 use crate::types::{HardState, LogEntry, LogIndex, NodeId, Term};
 
 mod election;
+mod read_index;
 mod replication;
 
 pub type ReadToken = u64;
@@ -53,9 +54,10 @@ impl SplitMix64 {
     }
 }
 
-/// A read barrier waiting for `readable_term` to confirm the leader's term
-/// has committed an entry before it can be released. Wired up in Task 6.
-#[allow(dead_code)]
+/// A read barrier registered by `read_index`, waiting on the conditions
+/// `maybe_release_reads` (core/read_index.rs) checks before it can be
+/// released: current-term readability, post-registration quorum contact,
+/// and apply catch-up past `floor`.
 struct PendingRead {
     token: ReadToken,
     floor: LogIndex,
@@ -103,8 +105,8 @@ pub struct RaftCore<S: RaftStorage> {
     /// Wired up in Task 4+ for AppendEntries/heartbeat pacing diagnostics.
     #[allow(dead_code)]
     tick_count: u64,
-    /// Wired up in Task 6 for linearizable read barriers.
-    #[allow(dead_code)]
+    /// Reads registered via `read_index` awaiting release; see
+    /// core/read_index.rs.
     pending_reads: Vec<PendingRead>,
     /// Term whose entry has committed, enabling reads at or before it.
     readable_term: Option<Term>,
@@ -207,10 +209,6 @@ impl<S: RaftStorage> RaftCore<S> {
         self.elapsed = 0;
         self.election_deadline = self.rng.election_timeout(self.config.election_timeout);
     }
-
-    /// No-op stub; wired up in Task 6 to release pending linearizable reads
-    /// once `readable_term` confirms the leader's term has committed.
-    fn maybe_release_reads(&mut self) {}
 
     #[cfg(test)]
     pub(crate) fn stored_hard_state(&self) -> HardState {
