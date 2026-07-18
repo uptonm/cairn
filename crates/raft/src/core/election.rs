@@ -83,9 +83,8 @@ impl<S: RaftStorage> RaftCore<S> {
     /// state, and appends a no-op entry in the new term (the standard Raft
     /// technique for committing entries from prior terms indirectly).
     ///
-    /// `broadcast_append()` — the AppendEntries heartbeat/replication
-    /// broadcast — is a stub for this task; Task 4 replaces it with the
-    /// real implementation.
+    /// `broadcast_append()` (the AppendEntries heartbeat/replication
+    /// broadcast) lives in `replication.rs`.
     fn become_leader(&mut self) -> Result<()> {
         self.role = Role::Leader;
         self.leader_id = Some(self.config.id);
@@ -122,7 +121,7 @@ impl<S: RaftStorage> RaftCore<S> {
     /// emitted, but only when `term` actually advances `current_term` — a
     /// same-term step (e.g. discovering the current leader) must not touch
     /// storage.
-    fn become_follower(&mut self, term: Term, leader: Option<NodeId>) -> Result<()> {
+    pub(super) fn become_follower(&mut self, term: Term, leader: Option<NodeId>) -> Result<()> {
         if term > self.current_term() {
             let hs = HardState {
                 current_term: term,
@@ -133,12 +132,6 @@ impl<S: RaftStorage> RaftCore<S> {
         self.role = Role::Follower;
         self.leader_id = leader;
         self.reset_election_timer();
-        Ok(())
-    }
-
-    /// Temporary Task 3 stub for the AppendEntries broadcast; Task 4 gives
-    /// this a real body (heartbeat/replication to every peer).
-    fn broadcast_append(&mut self) -> Result<()> {
         Ok(())
     }
 

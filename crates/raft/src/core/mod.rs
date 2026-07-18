@@ -6,6 +6,7 @@ use crate::storage::RaftStorage;
 use crate::types::{HardState, LogEntry, LogIndex, NodeId, Term};
 
 mod election;
+mod replication;
 
 pub type ReadToken = u64;
 
@@ -84,6 +85,12 @@ pub struct RaftCore<S: RaftStorage> {
     votes: BTreeSet<NodeId>,
     next_index: BTreeMap<NodeId, LogIndex>,
     match_index: BTreeMap<NodeId, LogIndex>,
+    /// The "up-to" index of the most recent AppendEntries sent to each
+    /// peer (`prev_log_index + entries.len()`), recorded by
+    /// `send_append_to` so `handle_append_resp` can advance `match_index`
+    /// on success without re-deriving it from the (already-consumed)
+    /// request.
+    last_sent: BTreeMap<NodeId, LogIndex>,
     /// Wired up in Task 4/5 to track per-peer AppendEntries liveness.
     #[allow(dead_code)]
     last_contact_tick: BTreeMap<NodeId, u64>,
@@ -118,6 +125,7 @@ impl<S: RaftStorage> RaftCore<S> {
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            last_sent: BTreeMap::new(),
             last_contact_tick: BTreeMap::new(),
             tick_count: 0,
             pending_reads: Vec::new(),
@@ -138,9 +146,7 @@ impl<S: RaftStorage> RaftCore<S> {
                 self.heartbeat_elapsed += 1;
                 if self.heartbeat_elapsed >= self.config.heartbeat_interval {
                     self.heartbeat_elapsed = 0;
-                    // Task 4 wires the real heartbeat broadcast in here
-                    // (broadcast_append()); for now the skeleton only
-                    // resets the counter.
+                    self.broadcast_append()?;
                 }
             }
             Role::Follower | Role::PreCandidate | Role::Candidate => {
@@ -180,14 +186,14 @@ impl<S: RaftStorage> RaftCore<S> {
 
     /// Dispatch skeleton. `InstallSnapshot`/`InstallSnapshotResp` are
     /// permanently ignored here (snapshot install is out of RaftCore's
-    /// scope). `AppendEntries`/`AppendEntriesResp` are filled in by Task 4.
+    /// scope).
     pub fn step(&mut self, from: NodeId, msg: Message) -> Result<()> {
         match msg {
             Message::InstallSnapshot(_) | Message::InstallSnapshotResp(_) => Ok(()),
             Message::RequestVote(req) => self.handle_request_vote(from, req),
             Message::RequestVoteResp(resp) => self.handle_vote_resp(from, resp),
-            Message::AppendEntries(_) => Ok(()),
-            Message::AppendEntriesResp(_) => Ok(()),
+            Message::AppendEntries(req) => self.handle_append_entries(from, req),
+            Message::AppendEntriesResp(resp) => self.handle_append_resp(from, resp),
         }
     }
 
