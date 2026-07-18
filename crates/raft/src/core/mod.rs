@@ -146,7 +146,7 @@ impl<S: RaftStorage> RaftCore<S> {
             Role::Follower | Role::PreCandidate | Role::Candidate => {
                 self.elapsed += 1;
                 if self.elapsed >= self.election_deadline {
-                    self.start_prevote();
+                    self.start_prevote()?;
                 }
             }
         }

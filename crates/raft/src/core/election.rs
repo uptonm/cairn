@@ -13,7 +13,7 @@ impl<S: RaftStorage> RaftCore<S> {
     /// `voted_for` — it only asks "would you vote for me if I called a real
     /// election at term `current_term + 1`?" so a partitioned node can't
     /// bump its term (and disrupt the cluster) unless it could actually win.
-    pub(super) fn start_prevote(&mut self) {
+    pub(super) fn start_prevote(&mut self) -> Result<()> {
         self.role = Role::PreCandidate;
         self.votes = BTreeSet::new();
         self.votes.insert(self.config.id);
@@ -31,6 +31,14 @@ impl<S: RaftStorage> RaftCore<S> {
             }
         }
         self.reset_election_timer();
+        // Solo cluster (peers == [self]): the self-vote seeded above
+        // already meets quorum, but quorum is otherwise only re-checked
+        // when a vote response arrives -- which a lone node never gets.
+        // Promote immediately instead of hanging in PreCandidate forever.
+        if self.votes.len() >= self.quorum() {
+            self.become_candidate()?;
+        }
+        Ok(())
     }
 
     /// Promotes from pre-candidate (having won a pre-vote quorum) to a real
@@ -61,6 +69,12 @@ impl<S: RaftStorage> RaftCore<S> {
             if peer != self_id {
                 self.outbox.push((peer, Message::RequestVote(req.clone())));
             }
+        }
+        // Solo cluster: the self-vote seeded above already meets quorum;
+        // there's no peer left to send a real-vote response, so promote
+        // straight to leader instead of hanging in Candidate forever.
+        if self.votes.len() >= self.quorum() {
+            self.become_leader()?;
         }
         Ok(())
     }
@@ -141,7 +155,12 @@ impl<S: RaftStorage> RaftCore<S> {
             self.outbox.push((
                 from,
                 Message::RequestVoteResp(RequestVoteResp {
-                    term: self.current_term(),
+                    // Echo the CANDIDATE's prospective term (req.term), not
+                    // our own unbumped current_term: the pre-candidate's
+                    // tally compares resp.term against prospective_term, so
+                    // replying with current_term would make every grant
+                    // from a same-term peer look stale and get discarded.
+                    term: req.term,
                     vote_granted: granted,
                 }),
             ));
@@ -362,5 +381,70 @@ mod tests {
         assert_eq!(c.role(), Role::Leader);
         // leader appends a no-op in its term
         assert!(c.commit_index() <= 1);
+    }
+
+    // Finding 1 (Critical): a pre-vote responder must echo the CANDIDATE's
+    // prospective term (req.term), not its own unbumped current_term, or
+    // the pre-candidate's tally (which compares against prospective_term)
+    // discards every real grant and the cluster never promotes.
+    //
+    // This drives a REAL pre-vote round-trip through two nodes (not a
+    // hand-built resp) so it actually exercises the mismatch.
+    #[test]
+    fn prevote_reply_term_matches_prospective_term_and_wins_real_round_trip() {
+        // Node A: ticked past its election timeout -> PreCandidate at
+        // prospective term 1 (current_term 0 + 1).
+        let mut a = RaftCore::new(cfg(1, &[1, 2, 3]), MemStorage::default()).unwrap();
+        for _ in 0..40 {
+            a.tick().unwrap();
+        }
+        assert_eq!(a.role(), Role::PreCandidate);
+        let a_ready = a.ready();
+        let (to, req) = a_ready
+            .messages
+            .iter()
+            .find_map(|(to, m)| match m {
+                Message::RequestVote(rv) if rv.pre_vote => Some((*to, rv.clone())),
+                _ => None,
+            })
+            .expect("A must emit a pre-vote RequestVote");
+        assert_eq!(req.term, 1); // prospective term, current_term(A) is still 0
+
+        // Node B: a fresh follower at term 0 answers A's real pre-vote req.
+        let mut b = RaftCore::new(cfg(to, &[1, 2, 3]), MemStorage::default()).unwrap();
+        b.step(1, Message::RequestVote(req)).unwrap();
+        let b_ready = b.ready();
+        let resp = b_ready
+            .messages
+            .iter()
+            .find_map(|(_, m)| match m {
+                Message::RequestVoteResp(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("B must emit a RequestVoteResp");
+        assert!(resp.vote_granted);
+        // The core assertion: B echoes the PROSPECTIVE term (1), not its
+        // own unbumped current_term (0).
+        assert_eq!(resp.term, 1);
+        assert_eq!(b.current_term(), 0); // pre-vote must not mutate B's term
+
+        // Feed B's real response back into A.
+        a.step(to, Message::RequestVoteResp(resp)).unwrap();
+        assert_eq!(a.role(), Role::Candidate); // pre-vote quorum reached -> real candidate
+    }
+
+    // Finding 2 (liveness gap): a single-node cluster has self already at
+    // quorum the instant it seeds votes in start_prevote/become_candidate,
+    // but quorum was previously only re-checked when a vote RESPONSE
+    // arrived -- which a solo node never gets. It must self-promote all
+    // the way to Leader in one tick sequence.
+    #[test]
+    fn single_node_cluster_self_promotes_to_leader() {
+        let mut c = RaftCore::new(cfg(1, &[1]), MemStorage::default()).unwrap();
+        for _ in 0..40 {
+            c.tick().unwrap();
+        }
+        assert_eq!(c.role(), Role::Leader);
+        assert_eq!(c.current_term(), 1);
     }
 }
