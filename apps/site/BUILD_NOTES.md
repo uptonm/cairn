@@ -20,7 +20,7 @@
 ## Running it
 
 ```bash
-cd site
+cd apps/site
 bun install
 bun run dev     # http://localhost:3000 (or next free port)
 bun run build   # production build — must succeed before merging
