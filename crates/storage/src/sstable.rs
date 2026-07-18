@@ -1,3 +1,4 @@
+use crate::bloom::Bloom;
 use crate::error::{Error, Result};
 use crate::types::{InternalKey, Seqno};
 use std::fs::File;
@@ -5,6 +6,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"CAIRNSST";
+const BLOOM_BITS_PER_KEY: usize = 10;
 
 pub struct SsTableWriter {
     file: BufWriter<File>,
@@ -14,6 +16,7 @@ pub struct SsTableWriter {
 
 pub struct SsTableReader {
     entries: Vec<(InternalKey, Option<Vec<u8>>)>,
+    bloom: Bloom,
 }
 
 impl SsTableWriter {
@@ -56,7 +59,15 @@ impl SsTableWriter {
             idx.extend_from_slice(&off.to_le_bytes());
         }
         self.file.write_all(&idx)?;
+        let bloom_offset = index_offset + idx.len() as u64;
+
+        let keys: Vec<&[u8]> = self.index.iter().map(|(k, _, _)| k.as_slice()).collect();
+        let bloom = Bloom::build(&keys, BLOOM_BITS_PER_KEY);
+        let bloom_bytes = bloom.to_bytes();
+        self.file.write_all(&bloom_bytes)?;
+
         self.file.write_all(&index_offset.to_le_bytes())?;
+        self.file.write_all(&bloom_offset.to_le_bytes())?;
         self.file.write_all(&num.to_le_bytes())?;
         self.file.write_all(MAGIC)?;
         self.file.flush()?;
@@ -69,7 +80,7 @@ impl SsTableReader {
     pub fn open(path: &Path) -> Result<Self> {
         let mut file = File::open(path)?;
         let len = file.metadata()?.len();
-        if len < 24 {
+        if len < 32 {
             return Err(Error::Corruption("sstable too short".into()));
         }
         file.seek(SeekFrom::End(-8))?;
@@ -78,10 +89,18 @@ impl SsTableReader {
         if &magic != MAGIC {
             return Err(Error::Corruption("bad sstable magic".into()));
         }
-        file.seek(SeekFrom::End(-24))?;
-        let mut foot = [0u8; 16];
+        file.seek(SeekFrom::End(-32))?;
+        let mut foot = [0u8; 24];
         file.read_exact(&mut foot)?;
         let index_offset = u64::from_le_bytes(foot[0..8].try_into().unwrap());
+        let bloom_offset = u64::from_le_bytes(foot[8..16].try_into().unwrap());
+
+        let footer_start = len - 32;
+        let bloom_len = (footer_start - bloom_offset) as usize;
+        file.seek(SeekFrom::Start(bloom_offset))?;
+        let mut bloom_bytes = vec![0u8; bloom_len];
+        file.read_exact(&mut bloom_bytes)?;
+        let bloom = Bloom::from_bytes(&bloom_bytes)?;
 
         let mut r = BufReader::new(file);
         r.seek(SeekFrom::Start(0))?;
@@ -117,10 +136,13 @@ impl SsTableReader {
                 value,
             ));
         }
-        Ok(SsTableReader { entries })
+        Ok(SsTableReader { entries, bloom })
     }
 
     pub fn get(&self, user_key: &[u8]) -> Result<Option<(Seqno, Option<Vec<u8>>)>> {
+        if !self.bloom.contains(user_key) {
+            return Ok(None);
+        }
         // entries are sorted; newest version of a key sorts first.
         Ok(self
             .entries
@@ -161,6 +183,27 @@ mod tests {
         assert_eq!(r.get(b"a").unwrap(), Some((2, Some(b"a2".to_vec()))));
         assert_eq!(r.get(b"b").unwrap(), Some((3, None)));
         assert_eq!(r.get(b"missing").unwrap(), None);
+    }
+
+    #[test]
+    fn bloom_short_circuits_absent_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("3.sst");
+        let mut w = SsTableWriter::create(&path).unwrap();
+        w.add(&ik(b"apple", 1), &Some(b"a".to_vec())).unwrap();
+        w.add(&ik(b"banana", 1), &Some(b"b".to_vec())).unwrap();
+        w.add(&ik(b"cherry", 1), &Some(b"c".to_vec())).unwrap();
+        w.finish().unwrap();
+
+        let r = SsTableReader::open(&path).unwrap();
+        // present keys still resolve correctly
+        assert_eq!(r.get(b"apple").unwrap(), Some((1, Some(b"a".to_vec()))));
+        assert_eq!(r.get(b"banana").unwrap(), Some((1, Some(b"b".to_vec()))));
+        assert_eq!(r.get(b"cherry").unwrap(), Some((1, Some(b"c".to_vec()))));
+        // absent key: the bloom filter must reject it before the linear scan,
+        // and either way get() must return Ok(None).
+        assert!(!r.bloom.contains(b"durian"));
+        assert_eq!(r.get(b"durian").unwrap(), None);
     }
 
     #[test]
