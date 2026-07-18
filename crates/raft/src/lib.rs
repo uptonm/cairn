@@ -3,6 +3,7 @@ pub mod hardstate;
 pub mod log;
 pub mod oplog;
 pub mod rpc;
+pub mod transport;
 pub mod types;
 
 pub use error::{Error, Result};
