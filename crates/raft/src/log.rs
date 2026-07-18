@@ -69,6 +69,19 @@ impl RaftLog {
     pub fn snapshot_meta(&self) -> SnapshotMeta {
         self.snapshot
     }
+
+    pub fn truncate_suffix(&mut self, from_index: LogIndex) -> Result<()> {
+        debug_assert!(
+            from_index > self.snapshot.last_index,
+            "cannot truncate into snapshot"
+        );
+        if from_index > self.last_index() {
+            return Ok(());
+        }
+        self.writer.append(&Op::TruncateSuffix(from_index))?;
+        self.entries.retain(|e| e.index < from_index);
+        Ok(())
+    }
 }
 
 fn apply_op(entries: &mut Vec<LogEntry>, snapshot: &mut SnapshotMeta, op: Op) {
@@ -113,5 +126,31 @@ mod tests {
         assert_eq!(log.last_index(), 0);
         assert_eq!(log.last_term(), 0);
         assert_eq!(log.entry(1), None);
+    }
+
+    #[test]
+    fn truncate_suffix_removes_conflicting_tail() {
+        let dir = tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[e(1, 1), e(1, 2), e(1, 3), e(1, 4)]).unwrap();
+        log.truncate_suffix(3).unwrap();
+        assert_eq!(log.last_index(), 2);
+        assert_eq!(log.entry(3), None);
+        // can append fresh entries at the truncated position
+        log.append(&[e(5, 3)]).unwrap();
+        assert_eq!(log.entry(3), Some(&e(5, 3)));
+    }
+
+    #[test]
+    fn truncate_suffix_survives_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut log = RaftLog::open(dir.path()).unwrap();
+            log.append(&[e(1, 1), e(1, 2), e(1, 3)]).unwrap();
+            log.truncate_suffix(2).unwrap();
+        }
+        let log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.last_index(), 1);
+        assert_eq!(log.entry(2), None);
     }
 }
