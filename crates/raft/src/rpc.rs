@@ -1,5 +1,5 @@
 use crate::types::{LogEntry, LogIndex, NodeId, Term};
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RequestVoteReq {
