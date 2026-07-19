@@ -425,9 +425,12 @@ mod tests {
     use tokio::time::Instant;
 
     fn message(term: u64) -> Message {
+        // Arbitrary payload for exercising transport mechanics -- not
+        // simulating any specific pre-vote/real-vote scenario.
         Message::RequestVoteResp(RequestVoteResp {
             term,
             vote_granted: true,
+            pre_vote: false,
         })
     }
 

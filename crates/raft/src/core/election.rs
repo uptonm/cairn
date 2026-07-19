@@ -180,25 +180,17 @@ impl<S: RaftStorage> RaftCore<S> {
                 from,
                 Message::RequestVoteResp(RequestVoteResp {
                     // Echo OUR OWN (unbumped) current_term, not the
-                    // candidate's prospective term. The frozen
-                    // RequestVoteResp wire type carries no pre_vote flag, so
-                    // this is the only way a Candidate's tally can tell a
-                    // pre-vote grant apart from a real-vote grant: a real
-                    // vote (cast at prospective_term via become_candidate's
-                    // persisted bump) always echoes a term equal to the
-                    // candidate's new current_term, while a pre-vote grant
-                    // echoes a term that's one lower. That means a pre-vote
-                    // grant delivered LATE -- after the recipient has
-                    // already promoted itself to a real Candidate at
-                    // prospective_term -- is filtered out as stale
-                    // (`resp.term < current_term`) instead of being
-                    // miscounted as a real vote. Without this, a delayed
-                    // pre-vote straggler could hand a Candidate a "vote" no
-                    // peer ever actually cast for its real election,
-                    // letting it win with zero genuine grants — a second
-                    // leader in the same term.
+                    // candidate's prospective term (see the doc comment on
+                    // `RequestVoteResp::pre_vote` for why term alone still
+                    // can't be trusted as the discriminator: a peer already
+                    // at T+1 could echo a pre-vote grant carrying term T+1,
+                    // wire-identical in term to a real vote). `pre_vote: true`
+                    // below is what actually lets a Candidate's tally in
+                    // `handle_vote_resp` refuse to count this as a real vote,
+                    // no matter what term it carries.
                     term: self.current_term(),
                     vote_granted: granted,
+                    pre_vote: true,
                 }),
             ));
             return Ok(());
@@ -231,6 +223,7 @@ impl<S: RaftStorage> RaftCore<S> {
             Message::RequestVoteResp(RequestVoteResp {
                 term: current_term,
                 vote_granted: granted,
+                pre_vote: false,
             }),
         ));
         Ok(())
@@ -239,7 +232,14 @@ impl<S: RaftStorage> RaftCore<S> {
     pub(super) fn handle_vote_resp(&mut self, from: NodeId, resp: RequestVoteResp) -> Result<()> {
         match self.role {
             Role::PreCandidate => {
-                // A pre-vote responder now echoes its OWN current_term (see
+                // A PreCandidate never sent a real RequestVote, so a
+                // response with pre_vote == false is stale/foreign (e.g.
+                // left over from a prior real candidacy in an earlier
+                // term) and must not be tallied here.
+                if !resp.pre_vote {
+                    return Ok(());
+                }
+                // A pre-vote responder echoes its OWN current_term (see
                 // handle_request_vote), not our prospective_term, so the
                 // comparison here is against our own current_term too — a
                 // peer at or behind our term can still legitimately grant a
@@ -258,6 +258,15 @@ impl<S: RaftStorage> RaftCore<S> {
                 Ok(())
             }
             Role::Candidate => {
+                // THE FIX (closes residual C1): a delayed pre-vote grant
+                // must never count toward a real election's tally, even if
+                // its term happens to equal our current_term (which it can
+                // — a peer already at T+1 echoes a pre-vote grant carrying
+                // term T+1). Routing by the explicit flag instead of by
+                // term makes that coincidence harmless.
+                if resp.pre_vote {
+                    return Ok(());
+                }
                 let current_term = self.current_term();
                 if resp.term > current_term {
                     return self.become_follower(resp.term, None);
@@ -407,6 +416,7 @@ mod tests {
             Message::RequestVoteResp(RequestVoteResp {
                 term: 0,
                 vote_granted: true,
+                pre_vote: true,
             }),
         )
         .unwrap();
@@ -420,6 +430,7 @@ mod tests {
             Message::RequestVoteResp(RequestVoteResp {
                 term: 1,
                 vote_granted: true,
+                pre_vote: false,
             }),
         )
         .unwrap();
@@ -563,6 +574,79 @@ mod tests {
             Role::Candidate,
             "a delayed pre-vote grant must not, by itself, promote a Candidate to Leader"
         );
+    }
+
+    // Residual C1 (whole-branch review): the `prevote_straggler_is_not_counted_as_real_vote`
+    // fix above relied on TERM to separate a straggling pre-vote grant from
+    // a real vote -- but term alone breaks down the moment the straggler's
+    // granter was itself already at the candidate's prospective term. A
+    // peer at current_term == 1 that grants A's pre-vote echoes ITS OWN
+    // current_term (1), which is wire-identical to a real vote cast for A's
+    // term-1 election. Without routing strictly by the `pre_vote` flag, this
+    // grant slips past the Candidate branch's `resp.term == current_term`
+    // check and gets tallied as a real vote A never actually earned -- a
+    // second leader in the same term. This test hand-builds that exact
+    // interleaving and must fail if the Candidate branch doesn't filter
+    // `resp.pre_vote == true`.
+    #[test]
+    fn prevote_grant_from_peer_at_prospective_term_is_not_a_real_vote() {
+        let mut a = RaftCore::new(cfg(1, &[1, 2, 3]), MemStorage::default()).unwrap();
+        for _ in 0..40 {
+            a.tick().unwrap();
+        }
+        assert_eq!(a.role(), Role::PreCandidate);
+        let _ = a.ready(); // drain the pre-vote RequestVote broadcast
+
+        // Reach pre-vote quorum (self + peer 2) with an ordinary pre-vote
+        // grant from a fresh peer at term 0 -> A promotes to real Candidate
+        // at term 1.
+        a.step(
+            2,
+            Message::RequestVoteResp(RequestVoteResp {
+                term: 0,
+                vote_granted: true,
+                pre_vote: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(a.role(), Role::Candidate);
+        assert_eq!(a.current_term(), 1);
+        let _ = a.ready(); // drain the real RequestVote broadcast
+
+        // A concurrent candidate elsewhere raced to current_term == 1 too,
+        // and peer 3 granted THAT candidate's pre-vote, echoing peer 3's own
+        // current_term (1) -- a pre-vote grant that happens to carry the
+        // same term A is now running at. Fed to A, it must be ignored: A
+        // must NOT become Leader off a self-vote plus this pre-vote grant
+        // alone, because peer 3 never cast a real vote for A's election.
+        a.step(
+            3,
+            Message::RequestVoteResp(RequestVoteResp {
+                term: 1,
+                vote_granted: true,
+                pre_vote: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            a.role(),
+            Role::Candidate,
+            "a pre-vote grant carrying the candidate's own term must not be tallied as a real vote"
+        );
+
+        // A genuine real vote (pre_vote: false) at the same term must still
+        // win, proving the fix filters by flag rather than breaking real
+        // elections.
+        a.step(
+            3,
+            Message::RequestVoteResp(RequestVoteResp {
+                term: 1,
+                vote_granted: true,
+                pre_vote: false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(a.role(), Role::Leader);
     }
 
     // Finding 2 (liveness gap): a single-node cluster has self already at

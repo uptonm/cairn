@@ -376,6 +376,7 @@ mod tests {
             Message::RequestVoteResp(RequestVoteResp {
                 term: 0,
                 vote_granted: true,
+                pre_vote: true,
             }),
         )
         .unwrap();
@@ -386,6 +387,7 @@ mod tests {
             Message::RequestVoteResp(RequestVoteResp {
                 term: 1,
                 vote_granted: true,
+                pre_vote: false,
             }),
         )
         .unwrap();
