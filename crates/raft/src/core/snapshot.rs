@@ -1,3 +1,4 @@
+use super::membership::{decode_voters, encode_voters};
 use super::*;
 use crate::error::Error;
 use crate::rpc::{InstallSnapshotReq, InstallSnapshotResp};
@@ -31,7 +32,13 @@ impl<S: RaftStorage> RaftCore<S> {
             last_index: index,
             last_term,
         };
-        self.storage.save_snapshot(meta, &data)
+        // The configuration is part of the snapshot's state, not just the
+        // state machine's: persisting the live voter set alongside `data`
+        // is what lets a restart or a follower installing this snapshot
+        // recover the correct membership even after the `ConfigChange`
+        // entry that produced it is compacted out of the log.
+        let config = encode_voters(&self.voters);
+        self.storage.save_snapshot(meta, &data, &config)
     }
 
     /// Sends `peer` the whole current snapshot in one message (chunking
@@ -55,15 +62,20 @@ impl<S: RaftStorage> RaftCore<S> {
         if self.storage.snapshot_meta().last_index == 0 {
             return Ok(());
         }
-        let (meta, data) = self.storage.read_snapshot()?.ok_or_else(|| {
+        let (meta, data, config) = self.storage.read_snapshot()?.ok_or_else(|| {
             Error::Corruption("snapshot metadata present but bytes missing".into())
         })?;
+        // Sends exactly the config the snapshot recorded (not the live
+        // `self.voters`, which may have moved on since) — the follower must
+        // adopt the config as-of-this-snapshot, matching the state-machine
+        // bytes it's installing alongside it.
         let req = InstallSnapshotReq {
             term: self.current_term(),
             leader_id: self.config.id,
             last_index: meta.last_index,
             last_term: meta.last_term,
             data,
+            config,
         };
         self.outbox.push((peer, Message::InstallSnapshot(req)));
         Ok(())
@@ -112,9 +124,15 @@ impl<S: RaftStorage> RaftCore<S> {
             last_index: req.last_index,
             last_term: req.last_term,
         };
-        self.storage.save_snapshot(meta, &req.data)?;
+        self.storage.save_snapshot(meta, &req.data, &req.config)?;
         self.commit_index = req.last_index;
         self.last_applied = req.last_index;
+        // Adopt the snapshot's recorded config immediately, then let
+        // `recompute_voters` have the final say: any ConfigChange retained
+        // in a live tail beyond this snapshot's base (index > last_index)
+        // is more current than the snapshot itself and must win.
+        self.voters = decode_voters(&req.config)?;
+        self.recompute_voters()?;
         // The driver must reload its state machine from these bytes before
         // any further applies proceed — drained into Ready.restore.
         self.restore_buf = Some((meta, req.data));
@@ -156,6 +174,10 @@ mod tests {
     use crate::rpc::{AppendEntriesResp, InstallSnapshotReq, RequestVoteResp};
     use crate::storage::MemStorage;
     use crate::types::{HardState, LogEntry};
+
+    fn voters_bytes(ids: &[NodeId]) -> Vec<u8> {
+        encode_voters(&ids.iter().copied().collect())
+    }
 
     fn cfg(id: NodeId, peers: &[NodeId]) -> Config {
         Config {
@@ -262,7 +284,8 @@ mod tests {
                     last_index: 2,
                     last_term: 1
                 },
-                b"first".to_vec()
+                b"first".to_vec(),
+                voters_bytes(&[1, 2, 3])
             ))
         );
     }
@@ -329,6 +352,7 @@ mod tests {
                 last_index: 5,
                 last_term: 1,
                 data: b"state".to_vec(),
+                config: voters_bytes(&[1, 2, 3]),
             }),
         )
         .unwrap();
@@ -371,6 +395,7 @@ mod tests {
                 last_index: 5,
                 last_term: 1,
                 data: b"state".to_vec(),
+                config: voters_bytes(&[1, 2, 3]),
             }),
         )
         .unwrap();
@@ -388,6 +413,7 @@ mod tests {
                 last_index: 3,
                 last_term: 1,
                 data: b"stale-bogus".to_vec(),
+                config: b"also-bogus".to_vec(),
             }),
         )
         .unwrap();
@@ -420,6 +446,7 @@ mod tests {
                 last_index: 9,
                 last_term: 3,
                 data: b"nope".to_vec(),
+                config: b"nope-too".to_vec(),
             }),
         )
         .unwrap();
@@ -469,6 +496,90 @@ mod tests {
         assert_eq!(c.current_term(), higher);
     }
 
+    // --- Critical: InstallSnapshot must convey the config, not just data ---
+
+    /// A follower whose `next_index` has fallen behind a leader's compacted
+    /// config-change gets InstallSnapshot instead of AppendEntries. After
+    /// installing it, the follower's membership must match the leader's
+    /// config as of the snapshot — not the follower's own bootstrap peers.
+    /// Before the fix, `InstallSnapshotReq` carried no config at all, so a
+    /// freshly-installed follower had no way to learn the membership change
+    /// that got compacted away on the leader, and `recompute_voters` fell
+    /// back to its own stale bootstrap list.
+    #[test]
+    fn install_snapshot_conveys_config() {
+        use crate::core::membership::ConfChange;
+
+        // Bootstrap 3-node cluster: elect_leader's single-vote-grant helper
+        // assumes a quorum of 2, so membership grows via ConfChange rather
+        // than starting the election itself at 4+ voters.
+        let mut leader = elect_leader(1, &[1, 2, 3]);
+        let term = leader.current_term();
+        let ack = |t: Term| {
+            Message::AppendEntriesResp(AppendEntriesResp {
+                term: t,
+                success: true,
+                conflict_index: None,
+            })
+        };
+        leader.step(2, ack(term)).unwrap();
+        leader.step(3, ack(term)).unwrap();
+        let _ = leader.ready();
+        assert_eq!(leader.commit_index(), 1);
+
+        // Grow membership {1,2,3} -> {1,2,3,4}; quorum becomes 3.
+        assert!(leader
+            .propose_conf_change(ConfChange::AddVoter(4))
+            .unwrap()
+            .is_some());
+        let _ = leader.ready();
+        leader.step(2, ack(term)).unwrap();
+        leader.step(3, ack(term)).unwrap();
+        let _ = leader.ready();
+        assert_eq!(leader.commit_index(), 2);
+        assert_eq!(leader.voters(), vec![1, 2, 3, 4]);
+
+        // Grow again {1,2,3,4} -> {1,2,3,4,5}; quorum stays 3 (self + 2 + 3
+        // — peer 4 never contributes an ack, so it never catches up).
+        assert!(leader
+            .propose_conf_change(ConfChange::AddVoter(5))
+            .unwrap()
+            .is_some());
+        let _ = leader.ready();
+        leader.step(2, ack(term)).unwrap();
+        leader.step(3, ack(term)).unwrap();
+        let _ = leader.ready();
+        assert_eq!(leader.commit_index(), 3);
+        assert_eq!(leader.voters(), vec![1, 2, 3, 4, 5]);
+
+        leader.compact(3, b"state".to_vec()).unwrap();
+
+        // Peer 4 never acked anything: next_index[4] (seeded to 3 when it
+        // was added) is at/below the new snapshot base (3) -> it must
+        // receive InstallSnapshot, not AppendEntries.
+        leader.broadcast_append().unwrap();
+        let r = leader.ready();
+        let install = r
+            .messages
+            .iter()
+            .find(|(to, _)| *to == 4)
+            .map(|(_, m)| m.clone())
+            .expect("peer 4 must receive something");
+        let req = match install {
+            Message::InstallSnapshot(req) => req,
+            other => panic!("expected InstallSnapshot to peer 4, got {other:?}"),
+        };
+
+        // Peer 4 restarts fresh with its ORIGINAL bootstrap config (no 5) —
+        // if the fix works, installing the snapshot must adopt the leader's
+        // recorded config, not fall back to this bootstrap list.
+        let mut follower = RaftCore::new(cfg(4, &[1, 2, 3, 4]), MemStorage::default()).unwrap();
+        follower.step(1, Message::InstallSnapshot(req)).unwrap();
+        let _ = follower.ready();
+
+        assert_eq!(follower.voters(), vec![1, 2, 3, 4, 5]);
+    }
+
     #[test]
     fn valid_compact_drops_prefix_and_preserves_committed_state() {
         let mut c = leader_with_committed_entries();
@@ -492,7 +603,8 @@ mod tests {
                     last_index: 2,
                     last_term: 1
                 },
-                b"state".to_vec()
+                b"state".to_vec(),
+                voters_bytes(&[1, 2, 3])
             ))
         );
         // Entries <= 2 are gone; entry 3 survives.

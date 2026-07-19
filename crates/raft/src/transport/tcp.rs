@@ -428,6 +428,7 @@ mod tests {
                 last_index: 11,
                 last_term: 3,
                 data: b"snapshot".to_vec(),
+                config: b"voters".to_vec(),
             }),
             Message::InstallSnapshotResp(InstallSnapshotResp { term: 4 }),
         ]
@@ -466,6 +467,7 @@ mod tests {
                 last_index: 15,
                 last_term: 6,
                 data: Vec::new(),
+                config: Vec::new(),
             }),
         ]);
         messages
@@ -733,6 +735,7 @@ mod tests {
             last_index: 41,
             last_term: 22,
             data: vec![0x5a; 8 * 1024 * 1024],
+            config: b"voters".to_vec(),
         });
         let raw_peer = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
@@ -799,6 +802,7 @@ mod tests {
             last_index: 43,
             last_term: 24,
             data: vec![0x3c; 16 * 1024 * 1024],
+            config: b"voters".to_vec(),
         });
 
         let stalled_result =
@@ -849,6 +853,7 @@ mod tests {
             last_index: 101,
             last_term: 28,
             data: vec![0x6b; 16 * 1024 * 1024],
+            config: b"voters".to_vec(),
         });
 
         sender.send(2, expected.clone()).await.unwrap();
@@ -935,6 +940,7 @@ mod tests {
             last_index: 103,
             last_term: 36,
             data: vec![0x4c; 8 * 1024 * 1024],
+            config: b"voters".to_vec(),
         });
         let sending_transport = Arc::clone(&transport);
         let send = tokio::spawn(async move { sending_transport.send(2, large).await });
@@ -1198,6 +1204,7 @@ mod tests {
             last_index: 113,
             last_term: 58,
             data: vec![0x2a; 4096],
+            config: b"voters".to_vec(),
         });
         let encoded_len = bincode::serialize(&expected).unwrap().len();
 

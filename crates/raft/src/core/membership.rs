@@ -63,20 +63,27 @@ impl<S: RaftStorage> RaftCore<S> {
         self.voters.iter().copied().collect()
     }
 
-    /// Recomputes the live voter set from the log: the membership encoded
-    /// by the highest-index `ConfigChange` entry currently present (whether
-    /// committed or not — effect-on-append), or the bootstrap
-    /// `config.peers` if the log holds no config entry at all.
+    /// Recomputes the live voter set with this precedence:
+    /// 1. the membership encoded by the highest-index `ConfigChange` entry
+    ///    currently present in the live log tail (whether committed or not
+    ///    — effect-on-append);
+    /// 2. else the config persisted alongside the current snapshot, if one
+    ///    exists and recorded a non-empty config (see `RaftStorage::save_snapshot`
+    ///    / `compact`) — this is what lets a config that's been compacted
+    ///    out of the log (its `ConfigChange` entry gone) still be recovered
+    ///    correctly, rather than silently reverting to bootstrap;
+    /// 3. else the bootstrap `config.peers`, for a node that has never seen
+    ///    a config entry OR a snapshot at all.
     ///
     /// Called from `RaftCore::new` (so a config entry already durable
-    /// before a restart is honored rather than silently reverted to the
-    /// bootstrap peers) and after any log mutation that can add or remove
-    /// the latest config entry: an append (`propose_conf_change`, and a
-    /// follower adopting a leader's config entry via
-    /// `handle_append_entries`) or a truncation
-    /// (`handle_append_entries`'s conflict path, which can revert a config
-    /// entry that used to be the latest — effect-on-append implies
-    /// revert-on-truncation).
+    /// before a restart is honored — from the log tail or, if that's been
+    /// compacted away, from the snapshot — rather than silently reverted to
+    /// the bootstrap peers) and after any log mutation that can add or
+    /// remove the latest config entry: an append (`propose_conf_change`,
+    /// and a follower adopting a leader's config entry via
+    /// `handle_append_entries`) or a truncation (`handle_append_entries`'s
+    /// conflict path, which can revert a config entry that used to be the
+    /// latest — effect-on-append implies revert-on-truncation).
     pub(super) fn recompute_voters(&mut self) -> Result<()> {
         let snapshot_base = self.storage.snapshot_meta().last_index;
         let latest_config_change = self
@@ -86,7 +93,10 @@ impl<S: RaftStorage> RaftCore<S> {
             .rfind(|e| e.entry_type == EntryType::ConfigChange);
         self.voters = match latest_config_change {
             Some(entry) => decode_voters(&entry.command)?,
-            None => self.config.peers.iter().copied().collect(),
+            None => match self.storage.read_snapshot()? {
+                Some((_, _, config)) if !config.is_empty() => decode_voters(&config)?,
+                _ => self.config.peers.iter().copied().collect(),
+            },
         };
         Ok(())
     }
@@ -343,6 +353,48 @@ mod tests {
             None
         );
         assert_eq!(c.voters(), vec![1, 2, 3, 4]);
+    }
+
+    // --- Critical: configuration must survive compaction + restart ---
+
+    /// A `ConfigChange` that grows the voter set, once committed, must
+    /// remain the live membership even after it's compacted away into a
+    /// snapshot and the process restarts. Before the fix, `recompute_voters`
+    /// only ever looked at the LIVE LOG for a `ConfigChange` entry, so once
+    /// `compact()` swept the entry into a snapshot, a restart found no
+    /// config entry in the (now-empty) post-snapshot log and silently fell
+    /// back to the bootstrap `config.peers` — reverting membership to a
+    /// stale, smaller set and corrupting quorum math (split-brain risk).
+    #[test]
+    fn config_survives_compaction_and_restart() {
+        let mut c = elect_leader_with_committed_noop(1, &[1, 2, 3]);
+        let term = c.current_term();
+
+        assert!(c
+            .propose_conf_change(ConfChange::AddVoter(4))
+            .unwrap()
+            .is_some());
+        let _ = c.ready();
+        c.step(2, success_resp(term)).unwrap();
+        c.step(3, success_resp(term)).unwrap();
+        assert_eq!(c.commit_index(), 2);
+        assert_eq!(c.last_applied, 2);
+        assert_eq!(c.voters(), vec![1, 2, 3, 4]);
+
+        // Compact past the ConfigChange entry (index 2): the live log no
+        // longer holds any ConfigChange entry after this.
+        c.compact(2, b"state".to_vec()).unwrap();
+        assert_eq!(c.storage.entries_from(1).len(), 0);
+
+        // Reclaim storage (models a crash) and construct a fresh core over
+        // it with the ORIGINAL bootstrap config (peers [1,2,3]) — if the fix
+        // works, the restarted node's membership must come from the
+        // snapshot, not this bootstrap list.
+        let storage = c.into_storage();
+        let restarted = RaftCore::new(cfg(1, &[1, 2, 3]), storage).unwrap();
+
+        assert_eq!(restarted.voters(), vec![1, 2, 3, 4]);
+        assert_eq!(restarted.quorum(), 3); // majority of 4, not of the bootstrap 3
     }
 
     #[test]

@@ -457,6 +457,7 @@ mod tests {
             last_index: 0,
             last_term: 0,
             data: vec![],
+            config: vec![],
         });
         assert!(c.step(2, msg).is_ok());
         // last_index 0 <= this follower's snapshot base (0): stale, so

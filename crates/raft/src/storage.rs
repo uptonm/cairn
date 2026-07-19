@@ -1,6 +1,12 @@
 use crate::error::{Error, Result};
 use crate::types::{HardState, LogEntry, LogIndex, SnapshotMeta, Term};
 
+/// `(snapshot metadata, state-machine bytes, encoded voter set)` — what
+/// `RaftStorage::read_snapshot` returns for the latest saved snapshot. The
+/// voter set travels with the snapshot because it's part of the snapshot's
+/// state, not just the state machine's: see `RaftStorage::save_snapshot`.
+pub type StoredSnapshot = (SnapshotMeta, Vec<u8>, Vec<u8>);
+
 pub trait RaftStorage {
     fn hard_state(&self) -> HardState;
     fn save_hard_state(&mut self, hs: &HardState) -> Result<()>;
@@ -11,15 +17,21 @@ pub trait RaftStorage {
     fn snapshot_meta(&self) -> SnapshotMeta;
     fn append(&mut self, entries: &[LogEntry]) -> Result<()>;
     fn truncate_suffix(&mut self, index: LogIndex) -> Result<()>;
-    /// Persist `(meta, data)` as the latest snapshot and compact the log to
-    /// that base. Entries with `index <= meta.last_index` are dropped;
-    /// entries beyond it are kept only if they stay contiguous from
-    /// `meta.last_index + 1`, otherwise the whole remaining log is cleared
-    /// (a snapshot supersedes a shorter/divergent log). Rejects a snapshot
-    /// older than the one already stored.
-    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<()>;
-    /// The latest saved snapshot, or `None` if none has ever been saved.
-    fn read_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>>;
+    /// Persist `(meta, data, config)` as the latest snapshot and compact the
+    /// log to that base. `config` is the encoded voter set as of `meta`
+    /// (see `core::membership::encode_voters`) — the configuration is part
+    /// of the snapshot's state, not just the state machine's, so a restart
+    /// or a follower installing this snapshot can recover the correct
+    /// membership even after the `ConfigChange` entry that produced it has
+    /// been compacted out of the log. Entries with `index <= meta.last_index`
+    /// are dropped; entries beyond it are kept only if they stay contiguous
+    /// from `meta.last_index + 1`, otherwise the whole remaining log is
+    /// cleared (a snapshot supersedes a shorter/divergent log). Rejects a
+    /// snapshot older than the one already stored.
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8], config: &[u8]) -> Result<()>;
+    /// The latest saved snapshot as `(meta, data, config)`, or `None` if
+    /// none has ever been saved.
+    fn read_snapshot(&self) -> Result<Option<StoredSnapshot>>;
 }
 
 #[derive(Default)]
@@ -32,6 +44,10 @@ pub struct MemStorage {
     /// empty in practice, so `snapshot_data.is_empty()` doubles as the
     /// has-snapshot predicate without a separate bool flag.
     snapshot_data: Vec<u8>,
+    /// The encoded voter set as of `snapshot`, persisted alongside the
+    /// snapshot's state-machine bytes so membership survives compaction and
+    /// restart. See `save_snapshot`.
+    snapshot_config: Vec<u8>,
 }
 
 impl RaftStorage for MemStorage {
@@ -108,7 +124,7 @@ impl RaftStorage for MemStorage {
         Ok(())
     }
 
-    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<()> {
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8], config: &[u8]) -> Result<()> {
         if meta.last_index < self.snapshot.last_index {
             return Err(Error::Corruption(format!(
                 "snapshot cannot move backwards: current base {}, got {}",
@@ -123,14 +139,19 @@ impl RaftStorage for MemStorage {
         }
         self.snapshot = meta;
         self.snapshot_data = data.to_vec();
+        self.snapshot_config = config.to_vec();
         Ok(())
     }
 
-    fn read_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>> {
+    fn read_snapshot(&self) -> Result<Option<StoredSnapshot>> {
         if self.snapshot_data.is_empty() {
             return Ok(None);
         }
-        Ok(Some((self.snapshot, self.snapshot_data.clone())))
+        Ok(Some((
+            self.snapshot,
+            self.snapshot_data.clone(),
+            self.snapshot_config.clone(),
+        )))
     }
 }
 
@@ -211,6 +232,7 @@ mod tests {
                 last_term: 1,
             },
             b"snap",
+            b"cfg",
         )
         .unwrap();
         assert_eq!(
@@ -227,7 +249,8 @@ mod tests {
                     last_index: 2,
                     last_term: 1
                 },
-                b"snap".to_vec()
+                b"snap".to_vec(),
+                b"cfg".to_vec()
             ))
         );
         // entries <= 2 dropped; entry 3 (contiguous from 3) retained
@@ -247,6 +270,7 @@ mod tests {
                 last_term: 2,
             },
             b"x",
+            b"cfg",
         )
         .unwrap(); // base beyond log
         assert_eq!(s.last_index(), 5); // no entries; base is the snapshot
@@ -263,6 +287,7 @@ mod tests {
                 last_term: 1,
             },
             b"a",
+            b"cfg",
         )
         .unwrap();
         assert!(s
@@ -271,7 +296,8 @@ mod tests {
                     last_index: 3,
                     last_term: 1
                 },
-                b"b"
+                b"b",
+                b"cfg"
             )
             .is_err());
     }

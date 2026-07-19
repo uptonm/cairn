@@ -384,7 +384,12 @@ impl<S: RaftStorage> RaftCore<S> {
             }
         }
 
-        if excludes_self_on_commit {
+        // Only a Leader stepping down on its own committed removal makes
+        // sense here — a plain Follower being removed has no leadership to
+        // relinquish, and calling `become_follower` on it would needlessly
+        // clear `leader_id` mid-apply, severing its (still valid) knowledge
+        // of who to forward writes to.
+        if excludes_self_on_commit && self.role == Role::Leader {
             self.become_follower(current_term, None)?;
         }
         Ok(())

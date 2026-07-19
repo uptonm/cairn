@@ -36,7 +36,12 @@ pub(super) fn encoded_payload_len(message: &Message) -> crate::Result<usize> {
             Some(_) => Ok(4 + 8 + 1 + 1 + 8),
             None => Ok(4 + 8 + 1 + 1),
         },
-        Message::InstallSnapshot(request) => checked_add(4 + 8 + 8 + 8 + 8 + 8, request.data.len()),
+        Message::InstallSnapshot(request) => {
+            // variant(4) + term(8) + leader_id(8) + last_index(8) + last_term(8)
+            // + data-len-prefix(8) + data + config-len-prefix(8) + config
+            let len = checked_add(4 + 8 + 8 + 8 + 8 + 8, request.data.len())?;
+            checked_add(checked_add(len, 8)?, request.config.len())
+        }
         Message::InstallSnapshotResp(_) => Ok(4 + 8),
     }
 }
@@ -120,6 +125,7 @@ where
             last_index: frame.read_u64().await?,
             last_term: frame.read_u64().await?,
             data: frame.read_bytes().await?,
+            config: frame.read_bytes().await?,
         }),
         5 => Message::InstallSnapshotResp(InstallSnapshotResp {
             term: frame.read_u64().await?,
@@ -260,7 +266,8 @@ where
             write_u64(writer, request.leader_id, idle_timeout).await?;
             write_u64(writer, request.last_index, idle_timeout).await?;
             write_u64(writer, request.last_term, idle_timeout).await?;
-            write_bytes(writer, &request.data, idle_timeout).await
+            write_bytes(writer, &request.data, idle_timeout).await?;
+            write_bytes(writer, &request.config, idle_timeout).await
         }
         Message::InstallSnapshotResp(response) => {
             write_u32(writer, 5, idle_timeout).await?;
