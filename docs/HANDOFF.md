@@ -54,6 +54,68 @@ cargo fmt --check
 cd apps/site && bun install && bun run build  # site (run bun install from repo root for the workspace)
 ```
 
+## Driving cairn to 100% (roadmap · process · guardrails · gotchas)
+
+**GOAL:** drive cairn to 100% done — the full distributed KV in
+`docs/superpowers/specs/2026-07-18-cairn-distributed-kv-design.md` — one shippable
+subsystem at a time, each merged to a green `main`.
+
+**Immediate next step:** finish **Plan D** — resume `feat/raft-plan-d` in a
+worktree, do **T6** (sim scenarios) then **T7** (whole-branch opus review → merge).
+See the Plan D checkpoint section just below for exact steps + tracked minors.
+
+**Remaining roadmap** (each its own spec→plan→build→review→merge cycle, in order):
+- **Plan E** — async node driver wiring `RaftCore` + `Transport` + a
+  **`RaftLog`-backed `RaftStorage` adapter** (must adopt `LogEntry.entry_type` +
+  `save_snapshot(meta,data,config)`/`read_snapshot`) + an apply/restore callback.
+  The driver **must apply `Ready.restore` before any `Ready.apply` in one drained
+  batch.** Ship a real-TCP integration test (cluster elects a leader + replicates).
+- **Chaos/Jepsen harness** — drive N cores over the in-memory transport's fault
+  injection, record histories, verify with `lincheck`. FIRST extend lincheck's
+  `Event` type for **crashed ops** (invoked, no response). Also drive **reads**
+  through it (the Plan C/D sim doesn't observe reads).
+- **Crash-hardening finale** — storage MANIFEST of live SSTables (crash-atomic
+  multi-file compaction); resolve the transport HOL-blocking + seed-determinism
+  caveats (`crates/raft/TRANSPORT_NOTES.md`).
+- **Phase 2** — MVCC transactions (snapshot isolation) over the replicated store.
+- **Phase 3** — multi-Raft (many groups, one node set).
+- **Phase 4** — shard router + control plane + dashboard (TS/Bun, `apps/*`).
+
+**Build process:** superpowers **brainstorming → writing-plans →
+subagent-driven-development**. Each subsystem: spec (surface only genuine design
+forks — the user delegates most, "you choose") → bite-sized TDD plan → execute
+subagent-driven. Per task: fresh implementer subagent (**sonnet** for judgment,
+**haiku** only for pure code-complete transcription) → adversarial reviewer → fix
+loop until clean → after all tasks, a **whole-branch review on OPUS**. **The
+whole-branch opus review has caught a Critical safety bug in EVERY subsystem it has
+reviewed — never skip it.** Use **OPUS reviewers on consensus-critical tasks**
+(election/replication/commit/read-index/membership/snapshot), sonnet elsewhere.
+Use the skill's `scripts/task-brief PLAN N` and `scripts/review-package BASE HEAD`;
+hand subagents FILE PATHS, not pasted text; record the BASE commit before each
+implementer (never `HEAD~1`). Track progress in `.superpowers/sdd/<name>-progress.md`.
+
+**Guardrails:**
+- Never work on `main` directly — branch in a worktree, PR, merge. Verify
+  `cargo test --workspace` + `cargo clippy --all-targets -- -D warnings` +
+  `cargo fmt --check` green before every merge.
+- Rust 2021, no `unsafe`, no `unwrap`/`expect` in library I/O paths, corrupt/torn
+  input recoverable (never panic), `BTreeMap`/`BTreeSet` for behavior-affecting
+  order, logical time only in the core. Rust in `crates/`; TS in `apps/*`.
+- **`rpc.rs` is no longer frozen** — deliberately extended twice for correctness
+  (`RequestVoteResp.pre_vote`, `InstallSnapshotReq.config`). Extend it deliberately
+  when a phase needs a distinction the wire can't express, not gratuitously.
+- No public deploys without explicit user approval (site PR #13 is unmerged).
+- Pause only for genuine decisions that are the user's (scope forks, deploys) or an
+  unresolvable blocker. The user delegates most design calls.
+
+**Environment gotchas (learned the hard way):**
+- Multiple concurrent sessions share this repo; the PRIMARY checkout
+  `~/Projects/cairn` gets its branch switched out from under you mid-task. **Always
+  work in a dedicated git worktree** (`~/Projects/cairn-<subsystem>`), never the
+  primary checkout, never `main`.
+- `.superpowers/sdd/*.md` ledgers are **gitignored** — surface durable state into
+  this file before finishing any cycle.
+
 ## Plan D — IN PROGRESS (checkpoint after Task 5) — resume on branch `feat/raft-plan-d`
 
 Membership was changed from joint-consensus to **single-server changes** (simpler,
