@@ -58,8 +58,15 @@ pub(crate) fn decode_voters(bytes: &[u8]) -> Result<BTreeSet<NodeId>> {
 }
 
 impl<S: RaftStorage> RaftCore<S> {
-    #[cfg(test)]
-    pub(crate) fn voters(&self) -> Vec<NodeId> {
+    /// The node's live voter set, ascending. This is the membership every
+    /// quorum and peer-iteration decision is made against (see
+    /// `recompute_voters`), so it's the ground truth for observing a
+    /// single-server change taking effect — appended (effect-on-append),
+    /// committed, reverted on truncation, or recovered from a snapshot.
+    /// Exposed for the same reason as `into_storage`: the deterministic sim
+    /// harness needs to assert membership converged without reaching into
+    /// crate internals.
+    pub fn voters(&self) -> Vec<NodeId> {
         self.voters.iter().copied().collect()
     }
 
