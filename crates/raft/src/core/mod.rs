@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::error::Result;
 use crate::rpc::Message;
 use crate::storage::RaftStorage;
-use crate::types::{HardState, LogEntry, LogIndex, NodeId, Term};
+use crate::types::{HardState, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
 
 mod election;
 mod read_index;
@@ -24,6 +24,7 @@ pub struct Ready {
     pub messages: Vec<(NodeId, Message)>,
     pub apply: Vec<LogEntry>,
     pub reads: Vec<ReadToken>,
+    pub restore: Option<(SnapshotMeta, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +126,11 @@ pub struct RaftCore<S: RaftStorage> {
     outbox: Vec<(NodeId, Message)>,
     apply_buf: Vec<LogEntry>,
     reads_buf: Vec<ReadToken>,
+    /// Set when a snapshot arrives that the caller must install into its
+    /// state machine before further applies proceed; drained by `ready()`
+    /// into `Ready.restore`. Nothing populates this yet — that lands in
+    /// Task 3 (InstallSnapshot RPC handling).
+    restore_buf: Option<(SnapshotMeta, Vec<u8>)>,
 }
 
 impl<S: RaftStorage> RaftCore<S> {
@@ -153,6 +159,7 @@ impl<S: RaftStorage> RaftCore<S> {
             outbox: Vec::new(),
             apply_buf: Vec::new(),
             reads_buf: Vec::new(),
+            restore_buf: None,
         };
         core.reset_election_timer();
         Ok(core)
@@ -183,6 +190,7 @@ impl<S: RaftStorage> RaftCore<S> {
             messages: std::mem::take(&mut self.outbox),
             apply: std::mem::take(&mut self.apply_buf),
             reads: std::mem::take(&mut self.reads_buf),
+            restore: std::mem::take(&mut self.restore_buf),
         }
     }
 
