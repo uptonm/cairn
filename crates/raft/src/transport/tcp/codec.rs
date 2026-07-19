@@ -42,7 +42,9 @@ pub(super) fn encoded_payload_len(message: &Message) -> crate::Result<usize> {
 }
 
 pub(super) fn add_log_entry_len(len: usize, entry: &LogEntry) -> crate::Result<usize> {
-    checked_add(checked_add(len, 24)?, entry.command.len())
+    // term(8) + index(8) + command length prefix(8) + entry_type(1) = 25,
+    // plus the variable-length command bytes themselves.
+    checked_add(checked_add(len, 25)?, entry.command.len())
 }
 
 fn checked_add(left: usize, right: usize) -> crate::Result<usize> {
@@ -277,7 +279,8 @@ where
 {
     write_u64(writer, entry.term, idle_timeout).await?;
     write_u64(writer, entry.index, idle_timeout).await?;
-    write_bytes(writer, &entry.command, idle_timeout).await
+    write_bytes(writer, &entry.command, idle_timeout).await?;
+    write_u8(writer, entry.entry_type.to_byte(), idle_timeout).await
 }
 
 async fn write_bytes<W>(writer: &mut W, bytes: &[u8], idle_timeout: Duration) -> crate::Result<()>
@@ -407,7 +410,7 @@ where
     }
 
     async fn read_log_entries(&mut self) -> crate::Result<Vec<LogEntry>> {
-        const MIN_LOG_ENTRY_BYTES: usize = 24;
+        const MIN_LOG_ENTRY_BYTES: usize = 25;
         const TRAILING_LEADER_COMMIT_BYTES: usize = 8;
 
         let count = self.read_u64().await?;
@@ -430,11 +433,17 @@ where
             )
         })?;
         for _ in 0..count {
-            entries.push(LogEntry {
-                term: self.read_u64().await?,
-                index: self.read_u64().await?,
-                command: self.read_bytes().await?,
-            });
+            let term = self.read_u64().await?;
+            let index = self.read_u64().await?;
+            let command = self.read_bytes().await?;
+            let entry = match self.read_u8().await? {
+                0 => LogEntry::normal(term, index, command),
+                1 => LogEntry::config_change(term, index, command),
+                invalid => {
+                    return Err(corruption(format!("invalid log entry type byte {invalid}")));
+                }
+            };
+            entries.push(entry);
         }
         Ok(entries)
     }

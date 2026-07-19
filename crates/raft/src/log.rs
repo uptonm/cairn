@@ -137,11 +137,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn e(term: u64, index: u64) -> LogEntry {
-        LogEntry {
-            term,
-            index,
-            command: vec![index as u8],
-        }
+        LogEntry::normal(term, index, vec![index as u8])
     }
 
     #[test]

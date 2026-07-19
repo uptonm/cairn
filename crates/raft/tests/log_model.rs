@@ -32,7 +32,7 @@ proptest! {
             match op {
                 Op::Append => {
                     let index = model.last().map_or(snap.last_index, |e| e.index) + 1;
-                    let entry = LogEntry { term: next_term, index, command: vec![index as u8] };
+                    let entry = LogEntry::normal(next_term, index, vec![index as u8]);
                     log.append(std::slice::from_ref(&entry)).unwrap();
                     model.push(entry);
                     next_term += 1;

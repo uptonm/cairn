@@ -124,11 +124,7 @@ impl<S: RaftStorage> RaftCore<S> {
             }
         }
 
-        let noop = LogEntry {
-            term: self.current_term(),
-            index: next,
-            command: Vec::new(),
-        };
+        let noop = LogEntry::normal(self.current_term(), next, Vec::new());
         self.storage.append(std::slice::from_ref(&noop))?;
         self.next_index.insert(self_id, next + 1);
         self.match_index.insert(self_id, next);
@@ -339,12 +335,7 @@ mod tests {
     #[test]
     fn rejects_behind_candidate() {
         let mut s = MemStorage::default();
-        s.append(&[LogEntry {
-            term: 2,
-            index: 1,
-            command: vec![],
-        }])
-        .unwrap();
+        s.append(&[LogEntry::normal(2, 1, vec![])]).unwrap();
         let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), s).unwrap();
         c.step(
             1,

@@ -40,6 +40,10 @@ fn encode(op: &Op) -> Vec<u8> {
             b.extend_from_slice(&e.index.to_le_bytes());
             b.extend_from_slice(&(e.command.len() as u32).to_le_bytes());
             b.extend_from_slice(&e.command);
+            // entry_type goes at the END, after command, so the existing
+            // fixed-offset reads of term/index/clen above are unchanged —
+            // only the tail parsing gains a byte.
+            b.push(e.entry_type.to_byte());
         }
         Op::TruncateSuffix(from) => {
             b.push(1u8);
@@ -135,8 +139,17 @@ fn read_body<R: Read>(r: &mut R, remaining: u64) -> Result<Option<Vec<u8>>> {
             if !read_exact_or_eof(r, &mut cmd)? {
                 return Ok(None);
             }
+            remaining -= clen as u64;
+            let mut entry_type = [0u8; 1];
+            if remaining < entry_type.len() as u64 {
+                return Ok(None);
+            }
+            if !read_exact_or_eof(r, &mut entry_type)? {
+                return Ok(None);
+            }
             body.extend_from_slice(&fixed);
             body.extend_from_slice(&cmd);
+            body.extend_from_slice(&entry_type);
         }
         1 => {
             let mut fixed = [0u8; 8];
@@ -170,11 +183,15 @@ fn decode(body: &[u8]) -> Option<Op> {
             let index = u64::from_le_bytes(body[9..17].try_into().ok()?);
             let clen = u32::from_le_bytes(body[17..21].try_into().ok()?) as usize;
             let command = body.get(21..21 + clen)?.to_vec();
-            Some(Op::Append(LogEntry {
-                term,
-                index,
-                command,
-            }))
+            // An absent/short type byte (torn write) or an unrecognized
+            // value both mean the record can't be trusted — treat both as
+            // torn/corrupt (`None`), never panic.
+            let entry = match *body.get(21 + clen)? {
+                0 => LogEntry::normal(term, index, command),
+                1 => LogEntry::config_change(term, index, command),
+                _ => return None,
+            };
+            Some(Op::Append(entry))
         }
         1 => {
             let from = u64::from_le_bytes(body[1..9].try_into().ok()?);
@@ -199,14 +216,11 @@ fn decode(body: &[u8]) -> Option<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::EntryType;
     use tempfile::tempdir;
 
     fn entry(term: u64, index: u64, cmd: &[u8]) -> LogEntry {
-        LogEntry {
-            term,
-            index,
-            command: cmd.to_vec(),
-        }
+        LogEntry::normal(term, index, cmd.to_vec())
     }
 
     #[test]
@@ -231,6 +245,23 @@ mod tests {
         }
         drop(w);
         assert_eq!(read_all(&path).unwrap(), ops);
+    }
+
+    #[test]
+    fn config_change_entry_roundtrips_through_the_oplog() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ops");
+        let mut w = OpWriter::create(&path).unwrap();
+        let op = Op::Append(LogEntry::config_change(1, 1, b"add-voter".to_vec()));
+        w.append(&op).unwrap();
+        drop(w);
+
+        let replayed = read_all(&path).unwrap();
+        assert_eq!(replayed, vec![op]);
+        match &replayed[0] {
+            Op::Append(e) => assert_eq!(e.entry_type, EntryType::ConfigChange),
+            other => panic!("expected Op::Append, got {other:?}"),
+        }
     }
 
     #[test]

@@ -137,14 +137,10 @@ impl RaftStorage for MemStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LogEntry;
+    use crate::types::{EntryType, LogEntry};
 
     fn e(term: Term, index: LogIndex) -> LogEntry {
-        LogEntry {
-            term,
-            index,
-            command: vec![],
-        }
+        LogEntry::normal(term, index, vec![])
     }
 
     #[test]
@@ -166,6 +162,15 @@ mod tests {
         assert_eq!(s.term(3).unwrap(), Some(2));
         assert_eq!(s.term(4).unwrap(), None);
         assert_eq!(s.entries_from(2), vec![e(1, 2), e(2, 3)]);
+    }
+
+    #[test]
+    fn config_change_entry_survives_append_and_read_back() {
+        let mut s = MemStorage::default();
+        let entry = LogEntry::config_change(1, 1, b"add-voter 5".to_vec());
+        s.append(std::slice::from_ref(&entry)).unwrap();
+        assert_eq!(s.entries_from(1), vec![entry.clone()]);
+        assert_eq!(s.entries_from(1)[0].entry_type, EntryType::ConfigChange);
     }
 
     #[test]

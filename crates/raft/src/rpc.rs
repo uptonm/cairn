@@ -90,11 +90,7 @@ mod tests {
                 leader_id: 7,
                 prev_log_index: 10,
                 prev_log_term: 2,
-                entries: vec![LogEntry {
-                    term: 3,
-                    index: 11,
-                    command: b"set x".to_vec(),
-                }],
+                entries: vec![LogEntry::config_change(3, 11, b"set x".to_vec())],
                 leader_commit: 9,
             }),
             Message::AppendEntriesResp(AppendEntriesResp {
@@ -117,5 +113,14 @@ mod tests {
             let decoded = bincode::deserialize::<Message>(&encoded).unwrap();
             assert_eq!(decoded, message);
         }
+    }
+
+    #[test]
+    fn config_change_entry_type_survives_bincode_roundtrip() {
+        let entry = LogEntry::config_change(1, 1, b"add-voter 5".to_vec());
+        let encoded = bincode::serialize(&entry).unwrap();
+        let decoded: LogEntry = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.entry_type, crate::types::EntryType::ConfigChange);
+        assert_eq!(decoded, entry);
     }
 }

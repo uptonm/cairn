@@ -11,11 +11,7 @@ impl<S: RaftStorage> RaftCore<S> {
             return Ok(None);
         }
         let index = self.storage.last_index() + 1;
-        let entry = LogEntry {
-            term: self.current_term(),
-            index,
-            command,
-        };
+        let entry = LogEntry::normal(self.current_term(), index, command);
         self.storage.append(std::slice::from_ref(&entry))?;
 
         let self_id = self.config.id;
@@ -446,11 +442,7 @@ mod tests {
                 leader_id: 1,
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![LogEntry {
-                    term: 1,
-                    index: 1,
-                    command: b"a".to_vec(),
-                }],
+                entries: vec![LogEntry::normal(1, 1, b"a".to_vec())],
                 leader_commit: 0,
             }),
         )
@@ -487,21 +479,9 @@ mod tests {
     fn follower_rejects_on_prev_term_mismatch_with_conflict_index() {
         let mut s = MemStorage::default();
         s.append(&[
-            LogEntry {
-                term: 1,
-                index: 1,
-                command: vec![],
-            },
-            LogEntry {
-                term: 1,
-                index: 2,
-                command: vec![],
-            },
-            LogEntry {
-                term: 2,
-                index: 3,
-                command: vec![],
-            },
+            LogEntry::normal(1, 1, vec![]),
+            LogEntry::normal(1, 2, vec![]),
+            LogEntry::normal(2, 3, vec![]),
         ])
         .unwrap();
         let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), s).unwrap();
@@ -537,16 +517,8 @@ mod tests {
     fn follower_truncates_conflicting_suffix() {
         let mut s = MemStorage::default();
         s.append(&[
-            LogEntry {
-                term: 1,
-                index: 1,
-                command: vec![],
-            },
-            LogEntry {
-                term: 1,
-                index: 2,
-                command: vec![9],
-            },
+            LogEntry::normal(1, 1, vec![]),
+            LogEntry::normal(1, 2, vec![9]),
         ])
         .unwrap();
         let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), s).unwrap();
@@ -558,11 +530,7 @@ mod tests {
                 leader_id: 1,
                 prev_log_index: 1,
                 prev_log_term: 1,
-                entries: vec![LogEntry {
-                    term: 2,
-                    index: 2,
-                    command: vec![7],
-                }],
+                entries: vec![LogEntry::normal(2, 2, vec![7])],
                 leader_commit: 0,
             }),
         )
@@ -617,11 +585,7 @@ mod tests {
         let mut s = MemStorage::default();
         s.append(
             &(1..=10)
-                .map(|i| LogEntry {
-                    term: 1,
-                    index: i,
-                    command: vec![],
-                })
+                .map(|i| LogEntry::normal(1, i, vec![]))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -635,11 +599,7 @@ mod tests {
         let _ = c.ready();
 
         c.storage
-            .append(&[LogEntry {
-                term: 1,
-                index: 11,
-                command: vec![],
-            }])
+            .append(&[LogEntry::normal(1, 11, vec![])])
             .unwrap();
         c.send_append_to(2).unwrap(); // up_to = 11, next_index[2] still 5
         let _ = c.ready();
@@ -737,16 +697,8 @@ mod tests {
     fn leader_term2_prior_and_current_entries() -> RaftCore<MemStorage> {
         let mut s = MemStorage::default();
         s.append(&[
-            LogEntry {
-                term: 1,
-                index: 1,
-                command: vec![],
-            },
-            LogEntry {
-                term: 2,
-                index: 2,
-                command: vec![],
-            },
+            LogEntry::normal(1, 1, vec![]),
+            LogEntry::normal(2, 2, vec![]),
         ])
         .unwrap();
         s.save_hard_state(&HardState {
@@ -829,16 +781,8 @@ mod tests {
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![
-                    LogEntry {
-                        term: 1,
-                        index: 1,
-                        command: b"a".to_vec(),
-                    },
-                    LogEntry {
-                        term: 1,
-                        index: 2,
-                        command: b"b".to_vec(),
-                    },
+                    LogEntry::normal(1, 1, b"a".to_vec()),
+                    LogEntry::normal(1, 2, b"b".to_vec()),
                 ],
                 leader_commit: 5, // beyond this follower's last_index (2)
             }),

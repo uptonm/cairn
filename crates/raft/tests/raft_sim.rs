@@ -930,38 +930,13 @@ fn determinism() {
 #[test]
 fn containment_check_detects_a_lost_committed_entry() {
     let mut committed = BTreeMap::new();
-    committed.insert(
-        1,
-        LogEntry {
-            term: 1,
-            index: 1,
-            command: b"a".to_vec(),
-        },
-    );
-    committed.insert(
-        2,
-        LogEntry {
-            term: 1,
-            index: 2,
-            command: b"b".to_vec(),
-        },
-    );
-    committed.insert(
-        3,
-        LogEntry {
-            term: 2,
-            index: 3,
-            command: b"c".to_vec(),
-        },
-    );
+    committed.insert(1, LogEntry::normal(1, 1, b"a".to_vec()));
+    committed.insert(2, LogEntry::normal(1, 2, b"b".to_vec()));
+    committed.insert(3, LogEntry::normal(2, 3, b"c".to_vec()));
 
     // Leader's applied log has index 1 only — committed index 2 (and 3) are
     // simply beyond its length, never rewritten, just LOST.
-    let leader_missing_committed_entries = vec![LogEntry {
-        term: 1,
-        index: 1,
-        command: b"a".to_vec(),
-    }];
+    let leader_missing_committed_entries = vec![LogEntry::normal(1, 1, b"a".to_vec())];
 
     let result = check_containment(&committed, &leader_missing_committed_entries);
     assert!(
@@ -972,21 +947,9 @@ fn containment_check_detects_a_lost_committed_entry() {
 
     // A leader log that HAS every committed index, correctly, must pass.
     let leader_with_everything = vec![
-        LogEntry {
-            term: 1,
-            index: 1,
-            command: b"a".to_vec(),
-        },
-        LogEntry {
-            term: 1,
-            index: 2,
-            command: b"b".to_vec(),
-        },
-        LogEntry {
-            term: 2,
-            index: 3,
-            command: b"c".to_vec(),
-        },
+        LogEntry::normal(1, 1, b"a".to_vec()),
+        LogEntry::normal(1, 2, b"b".to_vec()),
+        LogEntry::normal(2, 3, b"c".to_vec()),
     ];
     assert!(
         check_containment(&committed, &leader_with_everything).is_ok(),

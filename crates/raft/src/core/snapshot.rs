@@ -498,11 +498,7 @@ mod tests {
         // Entries <= 2 are gone; entry 3 survives.
         assert_eq!(
             c.storage.entries_from(1),
-            vec![LogEntry {
-                term: 1,
-                index: 3,
-                command: b"set y=2".to_vec(),
-            }]
+            vec![LogEntry::normal(1, 3, b"set y=2".to_vec())]
         );
         // Compaction never touches these.
         assert_eq!(c.storage.last_index(), pre_last_index);

@@ -18,4 +18,4 @@ pub use rpc::{
 };
 pub use storage::{MemStorage, RaftStorage};
 pub use transport::tcp::TcpTransport;
-pub use types::{HardState, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
+pub use types::{EntryType, HardState, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
