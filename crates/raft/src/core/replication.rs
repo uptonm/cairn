@@ -238,19 +238,24 @@ impl<S: RaftStorage> RaftCore<S> {
             // actually persisted, whichever in-flight request this
             // response corresponds to. An empty queue means a duplicate or
             // otherwise stale success with nothing left to attribute it
-            // to — don't advance match_index off it.
+            // to — don't advance match_index off it, and (see below) don't
+            // count it toward ack_count either.
             if let Some(up_to) = self.inflight.get_mut(&from).and_then(VecDeque::pop_front) {
                 let match_idx = self.match_index.get(&from).copied().unwrap_or(0).max(up_to);
                 self.match_index.insert(from, match_idx);
                 self.next_index.insert(from, match_idx + 1);
+                // Gated on a genuine pop (not incremented unconditionally):
+                // this is what lets read_index.rs prove — by pigeonhole —
+                // that a peer acked a send made after a given read
+                // registered, WITHOUT assuming the transport never
+                // redelivers a success. A duplicate/redelivered success
+                // finds an empty queue (no pop, no increment), so
+                // ack_count[P] can never exceed the number of distinct
+                // sends actually popped for P, which is <= send_count[P]
+                // by construction (see PendingRead::barrier and
+                // maybe_release_reads).
+                *self.ack_count.entry(from).or_default() += 1;
             }
-            // Distinct same-term successes correspond 1:1 with distinct
-            // sends (no message duplication), so this counter is what lets
-            // read_index.rs prove — by pigeonhole — that a peer acked a
-            // send made after a given read registered rather than merely
-            // processing a reply after that point (see PendingRead::barrier
-            // and maybe_release_reads).
-            *self.ack_count.entry(from).or_default() += 1;
             self.maybe_advance_commit()?;
             // Fresh contact and/or a commit advance may have just satisfied
             // a pending read's release conditions (core/read_index.rs) —
@@ -863,5 +868,93 @@ mod tests {
             m, Message::AppendEntriesResp(a) if !a.success && a.term == 5 && a.conflict_index.is_none()
         )));
         assert_eq!(c.leader_id(), None); // stale AE must not adopt the sender as leader
+    }
+
+    // --- read-index ack_count must gate on a genuine inflight pop
+    // (duplicate-ack safety) ---
+    //
+    // `maybe_release_reads` (core/read_index.rs) proves a read safe via
+    // pigeonhole: `ack_count[P] > barrier[P]` implies P acked a send made
+    // after the read registered, PROVIDED every same-term success bumping
+    // `ack_count` corresponds to a DISTINCT send. `match_index` already
+    // gets this for free — it only advances when `inflight.pop_front()`
+    // yields `Some` (an empty queue means a duplicate/stale success with
+    // nothing left to attribute it to). `ack_count` must use the same
+    // gate, or a duplicated/redelivered success can inflate it past a
+    // read's barrier with no corresponding post-registration send.
+    #[test]
+    fn duplicate_success_does_not_inflate_ack_count_or_release_read() {
+        let mut c = elect_leader(1, &[1, 2, 3]);
+        let term = c.current_term();
+
+        // Get the leader fully readable: peer 2 acks the no-op (index 1),
+        // reaching quorum (self + peer 2) and setting readable_term.
+        c.step(2, success_resp(term)).unwrap();
+        let _ = c.ready();
+        assert_eq!(c.readable_term, Some(term));
+        assert_eq!(c.commit_index(), 1);
+        assert_eq!(c.ack_count_of(2), 1);
+
+        // Arrange one outstanding in-flight send to peer 2, distinct from
+        // what's already been acked, so send_count[2] > ack_count[2] —
+        // exactly the state a real send-in-progress leaves behind.
+        c.inflight.entry(2).or_default().push_back(2);
+        *c.send_count.entry(2).or_default() += 1;
+        let send_before = c.send_count.get(&2).copied().unwrap_or(0);
+        assert!(
+            send_before > c.ack_count_of(2),
+            "must have an unacked outstanding send"
+        );
+
+        // Register a read by hand: barrier[2] snapshots send_count[2] as
+        // it stands right now (including the outstanding send above),
+        // mirroring what `read_index` does before it forces a broadcast.
+        c.pending_reads.push(PendingRead {
+            token: 7,
+            floor: c.commit_index,
+            barrier: c.send_count.clone(),
+        });
+        let barrier_for_2 = send_before;
+
+        // Deliver that outstanding send's success: it pops the one
+        // in-flight entry, so ack_count[2] legitimately advances — but
+        // only up TO the barrier (this send was already outstanding, and
+        // so already reflected in send_count, at registration time), not
+        // past it.
+        c.step(2, success_resp(term)).unwrap();
+        assert_eq!(c.ack_count_of(2), barrier_for_2);
+        let r = c.ready();
+        assert!(
+            r.reads.is_empty(),
+            "ack_count == barrier must not release (needs strictly >)"
+        );
+
+        // Deliver a DUPLICATE of that same success (a redelivered/retried
+        // network message). inflight[2] is now empty — there is no
+        // distinct send left to attribute this to, so it must be a no-op
+        // for ack_count, exactly like the existing match_index guard.
+        let ack_after_first = c.ack_count_of(2);
+        c.step(2, success_resp(term)).unwrap();
+        assert_eq!(
+            c.ack_count_of(2),
+            ack_after_first,
+            "a duplicate success on an empty inflight queue must not increment ack_count"
+        );
+        let r2 = c.ready();
+        assert!(
+            r2.reads.is_empty(),
+            "a duplicate ack must never release a read past its barrier"
+        );
+
+        // Now a genuine post-registration send/ack: pushes a fresh
+        // in-flight entry, and its success legitimately pops it, pushing
+        // ack_count strictly past the barrier for a real quorum (self +
+        // peer 2) — proving the fix didn't over-restrict.
+        c.inflight.entry(2).or_default().push_back(3);
+        *c.send_count.entry(2).or_default() += 1;
+        c.step(2, success_resp(term)).unwrap();
+        assert!(c.ack_count_of(2) > barrier_for_2);
+        let r3 = c.ready();
+        assert_eq!(r3.reads, vec![7]);
     }
 }

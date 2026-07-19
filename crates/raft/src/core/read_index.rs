@@ -44,11 +44,15 @@ impl<S: RaftStorage> RaftCore<S> {
     ///     barrier[peer]` (missing entries treated as 0), where `barrier`
     ///     is the `send_count` snapshot `read_index` took when this read
     ///     registered. Why this check is right (C2 fix): `ack_count[peer]`
-    ///     only ever increments on a genuine same-term success
-    ///     (`handle_append_resp`'s stale-term guard), and each such success
-    ///     corresponds to a distinct send — messages aren't duplicated (TCP
-    ///     and the sim both hold this invariant). If `ack_count[peer] >
-    ///     barrier[peer]`, peer has acked strictly more sends than were
+    ///     only increments when `handle_append_resp` pops a genuine entry
+    ///     off `inflight[peer]` for a same-term success (the same FIFO
+    ///     queue that gates `match_index`) — so it corresponds 1:1 with a
+    ///     distinct send REGARDLESS of whether the transport ever
+    ///     redelivers a success: a duplicate/stale success finds the queue
+    ///     already drained (or drained by the time it's processed) and is
+    ///     a no-op for `ack_count`. No no-duplication assumption on the
+    ///     transport is required. If `ack_count[peer] > barrier[peer]`, peer
+    ///     has acked strictly more distinct sends than were
     ///     outstanding at registration time, so by pigeonhole at least one
     ///     of its acked sends has sequence number greater than the
     ///     snapshot — i.e. was SENT after this read registered, not merely

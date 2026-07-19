@@ -242,6 +242,11 @@ impl<S: RaftStorage> RaftCore<S> {
     pub(crate) fn match_index_of(&self, peer: NodeId) -> LogIndex {
         self.match_index.get(&peer).copied().unwrap_or(0)
     }
+
+    #[cfg(test)]
+    pub(crate) fn ack_count_of(&self, peer: NodeId) -> u64 {
+        self.ack_count.get(&peer).copied().unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
