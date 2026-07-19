@@ -8,6 +8,7 @@ use crate::types::{HardState, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
 mod election;
 mod read_index;
 mod replication;
+mod snapshot;
 
 pub type ReadToken = u64;
 
