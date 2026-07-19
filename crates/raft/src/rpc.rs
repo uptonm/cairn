@@ -14,6 +14,14 @@ pub struct RequestVoteReq {
 pub struct RequestVoteResp {
     pub term: Term,
     pub vote_granted: bool,
+    /// Discriminates a pre-vote grant from a real-vote grant. Term alone
+    /// cannot: a pre-vote responder echoes ITS OWN current_term, which can
+    /// coincide with a candidate's real-election term (e.g. a peer already
+    /// at T+1 grants a pre-vote carrying term T+1, wire-identical to a real
+    /// vote at that term). `handle_vote_resp` routes strictly by this flag
+    /// per role rather than by term, so a stray pre-vote grant can never be
+    /// miscounted as a real vote (or vice versa).
+    pub pre_vote: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -75,6 +83,7 @@ mod tests {
             Message::RequestVoteResp(RequestVoteResp {
                 term: 2,
                 vote_granted: true,
+                pre_vote: false,
             }),
             Message::AppendEntries(AppendEntriesReq {
                 term: 3,

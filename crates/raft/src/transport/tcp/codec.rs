@@ -24,7 +24,7 @@ pub(super) fn serialized_frame_len(message: &Message) -> crate::Result<u32> {
 pub(super) fn encoded_payload_len(message: &Message) -> crate::Result<usize> {
     match message {
         Message::RequestVote(_) => Ok(4 + 8 + 8 + 8 + 8 + 1),
-        Message::RequestVoteResp(_) => Ok(4 + 8 + 1),
+        Message::RequestVoteResp(_) => Ok(4 + 8 + 1 + 1),
         Message::AppendEntries(request) => {
             let mut len = 4 + 8 + 8 + 8 + 8 + 8;
             for entry in &request.entries {
@@ -89,6 +89,7 @@ where
         1 => Message::RequestVoteResp(RequestVoteResp {
             term: frame.read_u64().await?,
             vote_granted: frame.read_bool().await?,
+            pre_vote: frame.read_bool().await?,
         }),
         2 => {
             let term = frame.read_u64().await?;
@@ -224,7 +225,8 @@ where
         Message::RequestVoteResp(response) => {
             write_u32(writer, 1, idle_timeout).await?;
             write_u64(writer, response.term, idle_timeout).await?;
-            write_bool(writer, response.vote_granted, idle_timeout).await
+            write_bool(writer, response.vote_granted, idle_timeout).await?;
+            write_bool(writer, response.pre_vote, idle_timeout).await
         }
         Message::AppendEntries(request) => {
             write_u32(writer, 2, idle_timeout).await?;

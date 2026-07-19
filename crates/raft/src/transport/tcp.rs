@@ -407,6 +407,7 @@ mod tests {
             Message::RequestVoteResp(RequestVoteResp {
                 term: 2,
                 vote_granted: true,
+                pre_vote: false,
             }),
             Message::AppendEntries(AppendEntriesReq {
                 term: 3,
@@ -643,6 +644,7 @@ mod tests {
         let expected = Message::RequestVoteResp(RequestVoteResp {
             term: 17,
             vote_granted: true,
+            pre_vote: false,
         });
         let raw_peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -766,6 +768,7 @@ mod tests {
         let expected = Message::RequestVoteResp(RequestVoteResp {
             term: 26,
             vote_granted: true,
+            pre_vote: false,
         });
         let recovering_peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -900,6 +903,7 @@ mod tests {
         let expected = Message::RequestVoteResp(RequestVoteResp {
             term: 38,
             vote_granted: true,
+            pre_vote: false,
         });
         transport.send(2, expected.clone()).await.unwrap();
         assert_eq!(
@@ -945,6 +949,7 @@ mod tests {
         let first = Message::RequestVoteResp(RequestVoteResp {
             term: 41,
             vote_granted: true,
+            pre_vote: false,
         });
         transport.send(2, first.clone()).await.unwrap();
         assert_eq!(first_old_message.await.unwrap(), first);
@@ -976,6 +981,7 @@ mod tests {
         let expected = Message::RequestVoteResp(RequestVoteResp {
             term: 42,
             vote_granted: false,
+            pre_vote: false,
         });
         transport.send(2, expected.clone()).await.unwrap();
         let delivered = tokio::time::timeout(Duration::from_secs(1), new_peer).await;
