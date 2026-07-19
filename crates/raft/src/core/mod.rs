@@ -6,9 +6,12 @@ use crate::storage::RaftStorage;
 use crate::types::{HardState, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
 
 mod election;
+mod membership;
 mod read_index;
 mod replication;
 mod snapshot;
+
+pub use membership::ConfChange;
 
 pub type ReadToken = u64;
 
@@ -92,6 +95,15 @@ pub struct RaftCore<S: RaftStorage> {
     election_deadline: u64,
     heartbeat_elapsed: u64,
     votes: BTreeSet<NodeId>,
+    /// The live cluster membership: the set of nodes whose votes/acks count
+    /// toward quorum right now. Derived from the log (`recompute_voters`,
+    /// core/membership.rs) rather than fixed at construction — it tracks
+    /// the highest-index `ConfigChange` entry currently present (effect on
+    /// append, reverted on truncation), falling back to the bootstrap
+    /// `config.peers` when the log holds no config entry. Every quorum
+    /// computation and peer-iteration site uses this, never `config.peers`
+    /// directly, once a config entry exists.
+    voters: BTreeSet<NodeId>,
     next_index: BTreeMap<NodeId, LogIndex>,
     match_index: BTreeMap<NodeId, LogIndex>,
     /// Per-peer FIFO queue of "up-to" indices (`prev_log_index +
@@ -149,6 +161,7 @@ impl<S: RaftStorage> RaftCore<S> {
             election_deadline: 0,
             heartbeat_elapsed: 0,
             votes: BTreeSet::new(),
+            voters: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
             inflight: BTreeMap::new(),
@@ -163,6 +176,12 @@ impl<S: RaftStorage> RaftCore<S> {
             restore_buf: None,
         };
         core.reset_election_timer();
+        // Seed from the bootstrap config, then immediately let the log
+        // override it if a config entry is already present — a restart
+        // must honor whatever membership change was last durably appended,
+        // not silently revert to the original bootstrap peers.
+        core.voters = core.config.peers.iter().copied().collect();
+        core.recompute_voters()?;
         Ok(core)
     }
 

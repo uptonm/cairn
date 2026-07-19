@@ -1,5 +1,7 @@
+use super::membership::decode_voters;
 use super::*;
 use crate::rpc::{AppendEntriesReq, AppendEntriesResp};
+use crate::types::EntryType;
 
 impl<S: RaftStorage> RaftCore<S> {
     /// Appends `command` to the log at `current_term`/`last_index() + 1`
@@ -33,8 +35,7 @@ impl<S: RaftStorage> RaftCore<S> {
     pub(super) fn broadcast_append(&mut self) -> Result<()> {
         let self_id = self.config.id;
         let peers: Vec<NodeId> = self
-            .config
-            .peers
+            .voters
             .iter()
             .copied()
             .filter(|&p| p != self_id)
@@ -195,13 +196,20 @@ impl<S: RaftStorage> RaftCore<S> {
                 .cloned()
                 .collect();
             self.storage.append(&new_entries)?;
+            // Effect-on-append (a freshly appended ConfigChange must take
+            // effect immediately, even on a follower) AND revert-on-
+            // truncation (the conflict branch above may have just dropped a
+            // config entry that used to be the latest) both land here,
+            // since this is the one place after either kind of log
+            // mutation in this handler.
+            self.recompute_voters()?;
         }
 
         let new_commit = req.leader_commit.min(self.storage.last_index());
         if new_commit > self.commit_index {
             self.commit_index = new_commit;
         }
-        self.advance_apply();
+        self.advance_apply()?;
 
         self.outbox.push((
             from,
@@ -310,8 +318,7 @@ impl<S: RaftStorage> RaftCore<S> {
         let mut n = last_index;
         while n > self.commit_index {
             let acked = self
-                .config
-                .peers
+                .voters
                 .iter()
                 .filter(|&&peer| self.match_index.get(&peer).copied().unwrap_or(0) >= n)
                 .count();
@@ -322,8 +329,7 @@ impl<S: RaftStorage> RaftCore<S> {
             n -= 1;
         }
 
-        self.advance_apply();
-        Ok(())
+        self.advance_apply()
     }
 
     /// Moves `last_applied` up to `commit_index` (all roles — leader after
@@ -336,14 +342,30 @@ impl<S: RaftStorage> RaftCore<S> {
     /// current term flips `readable_term`, which is what lets a leader
     /// start serving linearizable reads (Task 6) — it now knows it has
     /// applied at least one entry from its own term, per §8.
-    fn advance_apply(&mut self) {
+    ///
+    /// Also detects a `ConfigChange` COMMITTING (not merely appended) that
+    /// excludes this node: the moment `commit_index` crosses such an entry,
+    /// this node steps down (`become_follower`) and stops campaigning. This
+    /// runs here rather than at append time — `handle_append_entries`'s
+    /// append path and `propose_conf_change` already made the new config
+    /// live via `recompute_voters` — because stepping down early (on
+    /// append, before the change is durable on a majority) could strand
+    /// the entry uncommitted forever: a leader that stepped down the
+    /// instant it appended its own removal would never finish replicating
+    /// or committing it.
+    fn advance_apply(&mut self) -> Result<()> {
         if self.last_applied >= self.commit_index {
-            return;
+            return Ok(());
         }
         let snapshot_last = self.storage.snapshot_meta().last_index;
         let current_term = self.current_term();
         let target = self.commit_index;
         let mut pending = self.storage.entries_from(self.last_applied + 1).into_iter();
+        // Tracks whether the latest ConfigChange entry applied in THIS call
+        // excludes self — overwritten on each ConfigChange encountered, so
+        // a later entry re-including self correctly cancels an earlier
+        // exclusion within the same batch.
+        let mut excludes_self_on_commit = false;
 
         while self.last_applied < target {
             self.last_applied += 1;
@@ -354,9 +376,18 @@ impl<S: RaftStorage> RaftCore<S> {
                 if entry.term == current_term {
                     self.readable_term = Some(current_term);
                 }
+                if entry.entry_type == EntryType::ConfigChange {
+                    let committed_voters = decode_voters(&entry.command)?;
+                    excludes_self_on_commit = !committed_voters.contains(&self.config.id);
+                }
                 self.apply_buf.push(entry);
             }
         }
+
+        if excludes_self_on_commit {
+            self.become_follower(current_term, None)?;
+        }
+        Ok(())
     }
 }
 

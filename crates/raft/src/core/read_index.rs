@@ -86,7 +86,7 @@ impl<S: RaftStorage> RaftCore<S> {
         let self_id = self.config.id;
         let last_applied = self.last_applied;
         let ack_count = &self.ack_count;
-        let peers = &self.config.peers;
+        let peers = &self.voters;
 
         let mut released = Vec::new();
         self.pending_reads.retain(|read| {
