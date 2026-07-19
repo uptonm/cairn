@@ -54,7 +54,50 @@ cargo fmt --check
 cd apps/site && bun install && bun run build  # site (run bun install from repo root for the workspace)
 ```
 
-## NEXT: Plan D — snapshots/log-compaction + joint-consensus membership
+## Plan D — IN PROGRESS (checkpoint after Task 5) — resume on branch `feat/raft-plan-d`
+
+Membership was changed from joint-consensus to **single-server changes** (simpler,
+safer, majority-overlap guaranteed). Tasks 1–5 built + adversarially reviewed
+(opus on the consensus-critical ones), all on `feat/raft-plan-d` (pushed).
+**Baseline green: 141 raft lib + 9 sim + storage tests, clippy `-D warnings` + fmt clean.**
+
+- ✅ **T1** `RaftStorage` snapshot persistence (`save_snapshot(meta,data,config)` /
+  `read_snapshot() -> Option<(meta,data,config)>`) + `Ready.restore`.
+- ✅ **T2** core `compact(index, data)` — snapshot a committed prefix.
+- ✅ **T3** `InstallSnapshot` send/receive/restore (the core acts on it now).
+- ✅ **T4** `LogEntry.entry_type: EntryType { Normal, ConfigChange }` — additive,
+  torn-tail-safe op-log + TCP codec updated.
+- ✅ **T5** single-server membership (`ConfChange`, live `voters` set replaces
+  `config.peers` for ALL quorum/peer iteration, effect-on-append + revert-on-
+  truncation, one-change-in-flight, leader step-down-on-commit) **+ the config is
+  now part of snapshot state** (survives compaction/restart/install — a Critical
+  the review caught: a compacted ConfigChange used to revert voters to bootstrap →
+  wrong quorum). This extended `InstallSnapshotReq` with `config: Vec<u8>` (a
+  deliberate frozen-message extension, like Plan C's `RequestVoteResp.pre_vote`).
+
+**REMAINING:**
+- **T6** — extend `tests/raft_sim.rs` for dynamic membership + snapshots: a
+  `restore` sink + `compact_leader` control + `add_voter`/`remove_voter` controls;
+  `voters()`-aware invariant checks. Scenarios (each asserting the four safety
+  invariants after settle): `snapshot_catch_up`, `grow_three_to_five`,
+  `shrink_five_to_three`, `kill_and_replace`. Keep it deterministic (3× run).
+- **T7** — whole-branch **opus** review over `git merge-base main HEAD`..HEAD;
+  hunt: any `config.peers` still used for a quorum decision; config effect/revert
+  races; leader-removed step-down timing; snapshot↔log boundary off-by-ones;
+  `Ready.restore` vs `apply` ordering; op-log torn-tail with the type byte; codec
+  frame drift. Fix findings, update this handoff, PR + merge to `main`.
+
+**Tracked minors to fold into T7 (SDD ledger is gitignored, so surfaced here):**
+- Add an op-log test for a record torn *exactly* at the trailing `entry_type` byte.
+- `handle_install_snapshot_resp` lacks an explicit `resp.term < current_term` stale
+  guard (harmless — `match_index` uses `.max` — but inconsistent with `handle_append_resp`).
+- `Ready.apply` vs `Ready.restore` need a same-batch ordering contract: the **Plan E
+  driver** must apply `restore` before any `apply` in one drained batch.
+- `propose_conf_change` has no `readable_term`/current-term-commit gate (skipped in
+  T5 to avoid churn; consider adding).
+- `recompute_voters` rescans the log (+ a snapshot read on fallback) per call — perf only.
+
+## Original Plan D plan notes (superseded by single-server; kept for context)
 
 RaftCore (Plan C) is done. Build **Plan D** on top of it: `InstallSnapshot`
 handling + log compaction (the log store already has `compact_prefix`; wire the
