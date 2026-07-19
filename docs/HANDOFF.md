@@ -3,6 +3,11 @@
 Cold-start briefing for the next session. Read this first, then
 `docs/superpowers/specs/`.
 
+> **Latest:** Plan D (snapshots + single-server membership) is **DONE and merged
+> to a green `main`** — the whole-branch opus review caught a Critical
+> (split-brain) + an Important, both fixed. **Plan E (async node driver + real-TCP
+> integration) is the immediate next cycle.** See "Plan D — DONE" below.
+
 ## What cairn is
 
 A from-scratch **sharded, Raft-replicated, LSM-backed distributed key-value
@@ -38,7 +43,18 @@ Public repo: https://github.com/uptonm/cairn.
     `core/read_index.rs` (read-index linearizable reads). `tests/raft_sim.rs` —
     deterministic N-node sim proving the 4 safety invariants (election safety, log
     matching, state-machine safety, leader-completeness *containment*) under
-    partition/drop/reorder/crash-restart. **104 raft lib + 9 sim tests, green.**
+    partition/drop/reorder/crash-restart.
+  - **Plan D (snapshots + single-server membership)** — `RaftStorage` snapshot
+    persistence (`save_snapshot(meta,data,config)`/`read_snapshot`) + `Ready.restore`;
+    `core::compact(index,data)` (snapshot a committed prefix, storing the config
+    **as-of `index`**); `InstallSnapshot` send/receive/restore; `LogEntry.entry_type
+    { Normal, ConfigChange }` (additive, torn-tail-safe op-log + TCP codec);
+    **single-server membership** (`ConfChange{AddVoter,RemoveVoter}`,
+    `propose_conf_change`, a live `voters` set replacing bootstrap `config.peers`
+    for ALL quorum/peer iteration, effect-on-append + revert-on-truncation,
+    one-change-in-flight, leader step-down on committing its own removal, config
+    persisted as snapshot state). Sim extended with snapshot catch-up + grow/shrink/
+    replace membership scenarios. **148 raft lib + 13 sim tests, green.**
 - **`apps/site`** — Next.js + Tailwind + shadcn + Fumadocs marketing/docs site.
   Domain `cairn.uptonm.dev`. **NOT deployed** (design/SEO delegated to the user's
   designer; deploy needs explicit user go — Vercel root dir = `apps/site`).
@@ -60,9 +76,12 @@ cd apps/site && bun install && bun run build  # site (run bun install from repo 
 `docs/superpowers/specs/2026-07-18-cairn-distributed-kv-design.md` — one shippable
 subsystem at a time, each merged to a green `main`.
 
-**Immediate next step:** finish **Plan D** — resume `feat/raft-plan-d` in a
-worktree, do **T6** (sim scenarios) then **T7** (whole-branch opus review → merge).
-See the Plan D checkpoint section just below for exact steps + tracked minors.
+**Immediate next step:** **Plan E** — the async node driver wiring `RaftCore` +
+`Transport` + a `RaftLog`-backed `RaftStorage` adapter + apply/restore callback,
+with a real-TCP integration test. See "Plan D — DONE" below for the exact
+Plan-E-owned carryover items (the adapter must adopt `LogEntry.entry_type` +
+`save_snapshot(meta,data,config)`; the driver must apply `Ready.restore` before
+any `Ready.apply` in one drained batch).
 
 **Remaining roadmap** (each its own spec→plan→build→review→merge cycle, in order):
 - **Plan E** — async node driver wiring `RaftCore` + `Transport` + a
@@ -116,48 +135,61 @@ implementer (never `HEAD~1`). Track progress in `.superpowers/sdd/<name>-progres
 - `.superpowers/sdd/*.md` ledgers are **gitignored** — surface durable state into
   this file before finishing any cycle.
 
-## Plan D — IN PROGRESS (checkpoint after Task 5) — resume on branch `feat/raft-plan-d`
+## Plan D — DONE (merged to `main`, green)
 
-Membership was changed from joint-consensus to **single-server changes** (simpler,
-safer, majority-overlap guaranteed). Tasks 1–5 built + adversarially reviewed
-(opus on the consensus-critical ones), all on `feat/raft-plan-d` (pushed).
-**Baseline green: 141 raft lib + 9 sim + storage tests, clippy `-D warnings` + fmt clean.**
+Membership uses **single-server changes** (not joint consensus — simpler, safer,
+majority-overlap guaranteed). All 7 tasks built + adversarially reviewed (opus on
+the consensus-critical ones), whole-branch opus review clean after fixes, merged.
+**Green: 148 raft lib + 13 sim + 34 storage tests, clippy `-D warnings` + fmt clean,
+sim 3× deterministic.**
 
-- ✅ **T1** `RaftStorage` snapshot persistence (`save_snapshot(meta,data,config)` /
+- **T1** `RaftStorage` snapshot persistence (`save_snapshot(meta,data,config)` /
   `read_snapshot() -> Option<(meta,data,config)>`) + `Ready.restore`.
-- ✅ **T2** core `compact(index, data)` — snapshot a committed prefix.
-- ✅ **T3** `InstallSnapshot` send/receive/restore (the core acts on it now).
-- ✅ **T4** `LogEntry.entry_type: EntryType { Normal, ConfigChange }` — additive,
-  torn-tail-safe op-log + TCP codec updated.
-- ✅ **T5** single-server membership (`ConfChange`, live `voters` set replaces
+- **T2** core `compact(index, data)` — snapshot a committed prefix, storing the
+  config **as-of `index`** (a whole-branch-review fix: it used to store the live
+  effect-on-append `voters`, which could include an uncommitted change past the
+  compaction point → phantom voter after truncation).
+- **T3** `InstallSnapshot` send/receive/restore. `handle_install_snapshot` clears
+  `apply_buf` on install (stale sub-base applies would otherwise ride the same
+  `ready()` batch as `restore`); `handle_install_snapshot_resp` has a
+  `resp.term < current_term` stale-drop.
+- **T4** `LogEntry.entry_type: EntryType { Normal, ConfigChange }` — additive,
+  torn-tail-safe op-log (tested torn *exactly* at the trailing type byte) + TCP codec.
+- **T5** single-server membership (`ConfChange`, live `voters` set replaces
   `config.peers` for ALL quorum/peer iteration, effect-on-append + revert-on-
-  truncation, one-change-in-flight, leader step-down-on-commit) **+ the config is
-  now part of snapshot state** (survives compaction/restart/install — a Critical
-  the review caught: a compacted ConfigChange used to revert voters to bootstrap →
-  wrong quorum). This extended `InstallSnapshotReq` with `config: Vec<u8>` (a
+  truncation, one-change-in-flight, leader step-down-on-commit) **+ config as
+  snapshot state**. Extended `InstallSnapshotReq` with `config: Vec<u8>` (a
   deliberate frozen-message extension, like Plan C's `RequestVoteResp.pre_vote`).
+- **T6** sim harness: restore sink (restore-before-apply), `compact_leader`,
+  `add_voter`/`remove_voter` over a growable node set, `voters()`-aware
+  containment/convergence checks, restore-event proof the InstallSnapshot path
+  actually fires. Scenarios: `snapshot_catch_up`, `grow_three_to_five`,
+  `shrink_five_to_three`, `kill_and_replace`. `RaftCore::voters()` is now `pub`.
+- **T7** whole-branch opus review → **caught a Critical** (`MemStorage::read_snapshot`
+  used `snapshot_data.is_empty()` as its has-snapshot predicate → an empty-payload
+  snapshot read back as `None`, dropping the persisted config → `recompute_voters`
+  reverted to bootstrap peers → wrong quorum → **split-brain**; fixed by keying the
+  predicate off `snapshot.last_index == 0`, and `recompute_voters` now errors on a
+  present-but-empty config instead of reverting) + the T2 as-of-index config bug.
+  Continues the record: the whole-branch review has caught a Critical in *every*
+  subsystem — **never skip it.**
 
-**REMAINING:**
-- **T6** — extend `tests/raft_sim.rs` for dynamic membership + snapshots: a
-  `restore` sink + `compact_leader` control + `add_voter`/`remove_voter` controls;
-  `voters()`-aware invariant checks. Scenarios (each asserting the four safety
-  invariants after settle): `snapshot_catch_up`, `grow_three_to_five`,
-  `shrink_five_to_three`, `kill_and_replace`. Keep it deterministic (3× run).
-- **T7** — whole-branch **opus** review over `git merge-base main HEAD`..HEAD;
-  hunt: any `config.peers` still used for a quorum decision; config effect/revert
-  races; leader-removed step-down timing; snapshot↔log boundary off-by-ones;
-  `Ready.restore` vs `apply` ordering; op-log torn-tail with the type byte; codec
-  frame drift. Fix findings, update this handoff, PR + merge to `main`.
-
-**Tracked minors to fold into T7 (SDD ledger is gitignored, so surfaced here):**
-- Add an op-log test for a record torn *exactly* at the trailing `entry_type` byte.
-- `handle_install_snapshot_resp` lacks an explicit `resp.term < current_term` stale
-  guard (harmless — `match_index` uses `.max` — but inconsistent with `handle_append_resp`).
-- `Ready.apply` vs `Ready.restore` need a same-batch ordering contract: the **Plan E
-  driver** must apply `restore` before any `apply` in one drained batch.
-- `propose_conf_change` has no `readable_term`/current-term-commit gate (skipped in
-  T5 to avoid churn; consider adding).
-- `recompute_voters` rescans the log (+ a snapshot read on fallback) per call — perf only.
+**Deferred (tracked; NOT merge-blockers for a not-yet-live single-group core):**
+- **§4.2.2 removed-leader / removed-server disruption** — neither
+  `handle_request_vote` nor `handle_append_entries` checks candidate/leader
+  membership, so a removed-but-live node can win a re-election among survivors
+  (bounded: differs from the committed config by one member, so it's a *liveness*
+  churn, not a safety/split-brain violation). The sim's `shrink_five_to_three`
+  (seed 9) doesn't trip it, but another seed would (a true positive its voter-aware
+  containment check would catch). **Own this in Plan E/hardening**: pre-vote
+  leader-stickiness gate + drop votes from non-members. **Pre-production blocker.**
+- `propose_conf_change` has no `readable_term`/current-term-commit gate (a leader
+  can change membership before its own current-term no-op commits) — robustness,
+  not safety.
+- `save_snapshot`'s snapshot-boundary "contiguous" check is index-only, not
+  term-aware (a divergent boundary entry is reconciled by later AppendEntries
+  before it can apply — not a safety hole; tighten per §7 when convenient).
+- `recompute_voters` rescans the log (+ a snapshot read on fallback) per call — perf.
 
 ## Original Plan D plan notes (superseded by single-server; kept for context)
 
@@ -174,8 +206,9 @@ integration test) → **chaos harness** (drive N cores over fault injection, rec
 histories, check with `lincheck` — first extend lincheck's `Event` for crashed
 ops).
 
-Plan status: **A (log store) ✅ · B (transport) ✅ · C (core) ✅ · D ← NEXT · E ·
-chaos harness.** Specs: `docs/superpowers/specs/2026-07-18-cairn-raftcore-plan-c-design.md`
+Plan status: **A (log store) ✅ · B (transport) ✅ · C (core) ✅ · D (snapshots +
+membership) ✅ · E ← NEXT · chaos harness.** Specs:
+`docs/superpowers/specs/2026-07-18-cairn-raftcore-plan-c-design.md`
 (+ `-cairn-raft-design.md` + the distributed-kv design). Plan:
 `docs/superpowers/plans/2026-07-18-raft-core-plan-c.md`. Process: superpowers
 brainstorm → writing-plans → subagent-driven-development (per-task implement →
@@ -210,12 +243,13 @@ source of truth; the spec/plan prose on these two points is superseded:
 
 ## Tracked items / known limitations (surfaced here — the `.superpowers/sdd/*` ledgers are gitignored)
 
-**From Plan C (RaftCore) — deferred/tracked:**
-- **Plan D owns:** `InstallSnapshot` handling + snapshot install on lagging
-  followers (core currently accepts-and-ignores it); membership changes (config
-  fixed at `new`). Also: `term_at` in `replication.rs` masks a compacted index
-  (`0 < idx < snapshot.last_index`) as term 0 — harmless until snapshots exist,
-  but the conflict-backup scan must be revisited when Plan D adds compaction.
+**From Plan C/D (RaftCore) — deferred/tracked:**
+- ✅ **Plan D delivered** `InstallSnapshot` handling + snapshot install on lagging
+  followers, and single-server membership (config no longer fixed at `new`).
+  Re-verify: `term_at`/`term()` at the snapshot base and the conflict-backup scan
+  across a compacted region were part of the Plan D whole-branch review's hunt list
+  (came back clean) — but the chaos harness should re-exercise them under fault
+  injection.
 - **Plan E owns:** a `RaftLog`-backed `RaftStorage` adapter (Plan C ships only the
   in-memory `MemStorage`); the async node driver; real-TCP integration. Add a
   byte-level serialize-reload restart test then (Plan C's restart test reuses a
