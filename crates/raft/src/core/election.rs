@@ -106,6 +106,14 @@ impl<S: RaftStorage> RaftCore<S> {
         // reads — those were registered against a floor/quorum-contact
         // state that no longer means anything under this leadership.
         self.pending_reads.clear();
+        // Same reasoning for the read-index send/ack barrier counters: a
+        // stale send_count/ack_count relationship from a prior term (or
+        // this node's prior leadership incarnation) says nothing about
+        // contact under this term, and reusing it could let a leftover
+        // ack_count already exceed a fresh read's barrier without this
+        // term ever having sent anything.
+        self.send_count.clear();
+        self.ack_count.clear();
 
         let self_id = self.config.id;
         let next = self.storage.last_index() + 1;
@@ -678,7 +686,7 @@ mod tests {
         assert_eq!(r.apply[0].term, 1);
         // Readability follows: a fresh leader can't serve linearizable
         // reads until its own no-op has committed and applied.
-        c.read_index(1);
+        c.read_index(1).unwrap();
         let r2 = c.ready();
         assert_eq!(
             r2.reads,

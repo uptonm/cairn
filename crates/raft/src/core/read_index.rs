@@ -8,16 +8,25 @@ impl<S: RaftStorage> RaftCore<S> {
     /// expected to redirect the read to whichever node it believes is
     /// leader, so the token is dropped here rather than queued — the core
     /// must never release a read it can't back up.
-    pub fn read_index(&mut self, token: ReadToken) {
+    ///
+    /// Snapshots `send_count` as this read's `barrier` BEFORE forcing a
+    /// fresh broadcast, then forces that broadcast: a quiescent leader
+    /// (nothing due to send yet) would otherwise never generate a
+    /// post-barrier send for any peer to ack, and the read could never
+    /// confirm. See `maybe_release_reads` for how the barrier is used.
+    pub fn read_index(&mut self, token: ReadToken) -> Result<()> {
         if self.role != Role::Leader {
-            return;
+            return Ok(());
         }
+        let barrier = self.send_count.clone();
         self.pending_reads.push(PendingRead {
             token,
             floor: self.commit_index,
-            registered_tick: self.tick_count,
+            barrier,
         });
+        self.broadcast_append()?;
         self.maybe_release_reads();
+        Ok(())
     }
 
     /// Releases every pending read whose linearizability is now confirmed,
@@ -31,14 +40,29 @@ impl<S: RaftStorage> RaftCore<S> {
     ///     meaningful for this term;
     /// (c) a quorum of nodes affirmed contact with this leader strictly
     ///     AFTER the read registered (self always counts — it's always in
-    ///     touch with itself). The frozen `AppendEntriesResp` carries no
-    ///     round/read-id to tag a heartbeat with, so per-peer
-    ///     `last_contact_tick` strictly newer than `registered_tick` stands
-    ///     in for it: election safety guarantees one leader per term, so a
-    ///     quorum affirming this leader's authority after the read began
-    ///     means no other leader could have served this term in the
-    ///     interval — a higher-term leader would have stepped this one down
-    ///     instead;
+    ///     touch with itself). Checked, per peer, as `ack_count[peer] >
+    ///     barrier[peer]` (missing entries treated as 0), where `barrier`
+    ///     is the `send_count` snapshot `read_index` took when this read
+    ///     registered. Why this check is right (C2 fix): `ack_count[peer]`
+    ///     only ever increments on a genuine same-term success
+    ///     (`handle_append_resp`'s stale-term guard), and each such success
+    ///     corresponds to a distinct send — messages aren't duplicated (TCP
+    ///     and the sim both hold this invariant). If `ack_count[peer] >
+    ///     barrier[peer]`, peer has acked strictly more sends than were
+    ///     outstanding at registration time, so by pigeonhole at least one
+    ///     of its acked sends has sequence number greater than the
+    ///     snapshot — i.e. was SENT after this read registered, not merely
+    ///     replied to after. That's what a tick-based "last processed
+    ///     contact" comparison got wrong: a delayed reply to a
+    ///     PRE-registration heartbeat, merely PROCESSED after
+    ///     registration, could satisfy a tick check without attesting
+    ///     anything about the peer post-registration. A peer that defects
+    ///     to a higher term stops producing same-term successes entirely
+    ///     (its higher-term reply steps this leader down instead), so its
+    ///     `ack_count` can never cross a fresh barrier again. Election
+    ///     safety (one leader per term) then means a quorum clearing this
+    ///     bar rules out any other leader having served this term in the
+    ///     interval.
     /// (d) `last_applied >= floor`, the commit_index captured when the read
     ///     registered.
     ///
@@ -57,7 +81,7 @@ impl<S: RaftStorage> RaftCore<S> {
         let quorum = self.quorum();
         let self_id = self.config.id;
         let last_applied = self.last_applied;
-        let last_contact_tick = &self.last_contact_tick;
+        let ack_count = &self.ack_count;
         let peers = &self.config.peers;
 
         let mut released = Vec::new();
@@ -66,9 +90,8 @@ impl<S: RaftStorage> RaftCore<S> {
                 .iter()
                 .filter(|&&peer| {
                     peer == self_id
-                        || last_contact_tick
-                            .get(&peer)
-                            .is_some_and(|&t| t > read.registered_tick)
+                        || ack_count.get(&peer).copied().unwrap_or(0)
+                            > read.barrier.get(&peer).copied().unwrap_or(0)
                 })
                 .count();
             let confirmed = contacted >= quorum && last_applied >= read.floor;
@@ -148,7 +171,7 @@ mod tests {
     fn read_on_follower_is_never_released() {
         let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), MemStorage::default()).unwrap();
         assert_eq!(c.role(), Role::Follower);
-        c.read_index(7);
+        c.read_index(7).unwrap();
         assert!(c.pending_reads.is_empty(), "follower must not queue reads");
         for _ in 0..60 {
             c.tick().unwrap();
@@ -159,9 +182,9 @@ mod tests {
 
     /// Hand-built leader isolating the (b) readable_term gate from the (c)
     /// quorum-contact gate: quorum contact is pre-satisfied via directly
-    /// set `last_contact_tick`, but `readable_term` is still `None` (a
-    /// freshly elected leader whose no-op hasn't applied yet), so the read
-    /// must stay pending until a current-term entry actually applies.
+    /// set `ack_count`, but `readable_term` is still `None` (a freshly
+    /// elected leader whose no-op hasn't applied yet), so the read must
+    /// stay pending until a current-term entry actually applies.
     #[test]
     fn read_waits_for_current_term_commit() {
         let mut c = RaftCore::new(cfg(1, &[1, 2, 3]), MemStorage::default()).unwrap();
@@ -173,14 +196,14 @@ mod tests {
             .unwrap();
         c.role = Role::Leader;
         c.leader_id = Some(1);
-        c.tick_count = 10;
         assert_eq!(c.readable_term, None);
 
-        c.read_index(7);
+        c.read_index(7).unwrap();
         assert_eq!(c.pending_reads.len(), 1);
+        let _ = c.ready(); // drain the forced broadcast_append this triggers
 
         // Quorum contact already satisfied strictly after registration...
-        c.last_contact_tick.insert(2, 11);
+        c.ack_count.insert(2, 1);
         c.tick().unwrap();
         assert!(
             c.ready().reads.is_empty(),
@@ -200,7 +223,7 @@ mod tests {
 
     /// Isolates the (c) quorum-contact-after-registration gate: the leader
     /// is already fully "readable" (current-term entry applied), but no
-    /// peer has contacted it since the read registered. Contact is
+    /// peer has confirmed the barrier since the read registered. Contact is
     /// established via a real, delivered `AppendEntriesResp`.
     #[test]
     fn read_waits_for_quorum_contact_after_registration() {
@@ -214,13 +237,14 @@ mod tests {
         assert_eq!(c.readable_term, Some(term));
         assert_eq!(c.commit_index(), 1);
 
-        // Register the read now, at the current tick. No peer has
-        // contacted the leader *since* this registration yet (peer 2's
-        // last contact was recorded at an earlier or equal tick).
-        c.read_index(9);
+        // Register the read now. No peer has acked past this read's
+        // barrier yet (peer 2's ack_count is at most what the barrier
+        // snapshotted).
+        c.read_index(9).unwrap();
         assert_eq!(c.pending_reads.len(), 1);
-        let registered_tick = c.pending_reads[0].registered_tick;
-        assert!(c.last_contact_tick.get(&2).copied().unwrap_or(0) <= registered_tick);
+        let barrier_for_2 = c.pending_reads[0].barrier.get(&2).copied().unwrap_or(0);
+        assert!(c.ack_count.get(&2).copied().unwrap_or(0) <= barrier_for_2);
+        let _ = c.ready(); // drain the forced broadcast_append this triggers
 
         c.tick().unwrap();
         assert!(
@@ -228,8 +252,8 @@ mod tests {
             "must not release without post-registration quorum contact"
         );
 
-        // Advance the clock, then deliver a fresh ack: this pushes
-        // last_contact_tick[2] strictly past registered_tick.
+        // Deliver a fresh ack: this pushes ack_count[2] strictly past the
+        // read's barrier for peer 2.
         c.tick().unwrap();
         c.step(2, success_resp(term)).unwrap();
         let r = c.ready();
@@ -244,7 +268,7 @@ mod tests {
         // Get the leader fully readable and register a read.
         c.step(2, success_resp(term)).unwrap();
         let _ = c.ready();
-        c.read_index(11);
+        c.read_index(11).unwrap();
         assert_eq!(c.pending_reads.len(), 1);
 
         // A higher-term AppendEntries from another leader deposes this
@@ -288,7 +312,8 @@ mod tests {
         c.step(2, success_resp(term)).unwrap();
         let _ = c.ready();
 
-        c.read_index(42);
+        c.read_index(42).unwrap();
+        let _ = c.ready(); // drain the forced broadcast_append this triggers
         c.tick().unwrap();
         c.step(2, success_resp(term)).unwrap();
 
@@ -301,10 +326,10 @@ mod tests {
     //
     // Reviewer's exact scenario: `handle_append_resp` rejected only
     // `resp.term > current_term` (step down), so a delayed reply from an
-    // OLDER term fell through to the success branch and stamped
-    // `last_contact_tick`, letting a stale reply satisfy read-index's
-    // quorum-contact gate for a read a quorum never actually confirmed in
-    // the current term. This is a stale read / linearizability violation.
+    // OLDER term fell through to the success branch and stamped contact,
+    // letting a stale reply satisfy read-index's quorum-contact gate for a
+    // read a quorum never actually confirmed in the current term. This is a
+    // stale read / linearizability violation.
 
     /// Hand-built leader at an arbitrary `term`, already fully "readable"
     /// (current-term entry applied, per (b)) and with its own
@@ -332,15 +357,16 @@ mod tests {
         let term: Term = 5;
         let mut c = leader_at_term(term);
 
-        // Register the read at tick T (= 0 here).
-        c.read_index(99);
+        // Register the read (forces a broadcast, bumping send_count for
+        // every peer past the barrier snapshot).
+        c.read_index(99).unwrap();
         assert_eq!(c.pending_reads.len(), 1);
+        let _ = c.ready();
 
-        // Advance one tick (T+1) so tick_count > registered_tick, then
-        // deliver a delayed AppendEntriesResp from an OLDER term. Under the
-        // bug this stamps last_contact_tick[2] = T+1 anyway, satisfying
-        // quorum (self + peer 2) even though peer 2 never affirmed this
-        // leader in the current term.
+        // Deliver a delayed AppendEntriesResp from an OLDER term. Under the
+        // bug this counted as contact anyway (ack_count bumped regardless
+        // of term), satisfying quorum (self + peer 2) even though peer 2
+        // never affirmed this leader in the current term.
         c.tick().unwrap();
         c.step(
             2,
@@ -374,8 +400,9 @@ mod tests {
         let term: Term = 5;
         let mut c = leader_at_term(term);
 
-        c.read_index(100);
+        c.read_index(100).unwrap();
         assert_eq!(c.pending_reads.len(), 1);
+        let _ = c.ready(); // drain the forced broadcast_append this triggers
 
         c.tick().unwrap();
         c.step(2, success_resp(term)).unwrap();
@@ -396,8 +423,9 @@ mod tests {
         // `read_waits_for_current_term_commit`.
         c.readable_term = Some(term - 1);
 
-        c.read_index(55);
+        c.read_index(55).unwrap();
         assert_eq!(c.pending_reads.len(), 1);
+        let _ = c.ready(); // drain the forced broadcast_append this triggers
 
         c.tick().unwrap();
         c.step(2, success_resp(term)).unwrap();
@@ -408,5 +436,91 @@ mod tests {
             "a stale (non-current) readable_term must not satisfy the gate"
         );
         assert_eq!(c.pending_reads.len(), 1);
+    }
+
+    // --- C2 (whole-branch review): read-index leadership confirmation must
+    // be a per-read send-count barrier, not a tick-based "last processed
+    // contact" timestamp ---
+    //
+    // The bug: `last_contact_tick[peer]` was stamped when a same-term
+    // success was PROCESSED, but that success only attests the peer
+    // followed this leader when the peer SENT its reply — which can be
+    // BEFORE the read registered, and before the peer defected to a higher
+    // term. A delayed reply to a PRE-read heartbeat, processed after the
+    // read registers, wrongly satisfied `tick > registered_tick` and
+    // confirmed leadership even though it says nothing about the peer's
+    // state after the read began. Serving the read at that point could miss
+    // a write the peer helped a newer leader commit in the meantime — a
+    // linearizability violation.
+    //
+    // The fix: `barrier[peer]` snapshots `send_count[peer]` at
+    // registration. A peer only confirms once `ack_count[peer] >
+    // barrier[peer]` — i.e. it has acked MORE sends than were outstanding
+    // at registration time, which by pigeonhole means at least one acked
+    // send was made (not just replied to) after the read began.
+    //
+    // This test drives the exact failure shape: a send to peer 2 is already
+    // outstanding (unacked) BEFORE the read registers. The read's barrier
+    // for peer 2 is 1 (the pre-registration send). The delayed ack for that
+    // very send arrives after registration — under the old tick-based model
+    // this alone would release the read (it's PROCESSED after
+    // registration); under the barrier model it only brings ack_count up TO
+    // the barrier, not past it, so the read must stay pending. Only a
+    // second ack — for the read's own forced post-registration send —
+    // pushes ack_count strictly past the barrier and releases it.
+    #[test]
+    fn read_requires_ack_to_a_post_registration_send() {
+        let term: Term = 5;
+        let mut c = leader_at_term(term);
+        // last_applied (0) already meets floor (commit_index, also 0) and
+        // readable_term is already current, so only the (c)
+        // quorum-contact-after-registration gate is under test here.
+
+        // A send to peer 2 is already outstanding BEFORE the read
+        // registers (e.g. a heartbeat sent moments earlier that hasn't
+        // been acked yet).
+        c.broadcast_append().unwrap();
+        let _ = c.ready();
+        assert_eq!(c.send_count.get(&2).copied(), Some(1));
+        assert_eq!(c.ack_count.get(&2).copied().unwrap_or(0), 0);
+
+        c.read_index(77).unwrap();
+        assert_eq!(c.pending_reads.len(), 1);
+        let barrier_for_2 = c.pending_reads[0].barrier.get(&2).copied().unwrap_or(0);
+        assert_eq!(
+            barrier_for_2, 1,
+            "barrier must snapshot the pre-registration send_count"
+        );
+        let _ = c.ready(); // drain the forced broadcast_append this triggers
+        assert_eq!(
+            c.send_count.get(&2).copied(),
+            Some(2),
+            "read_index must force a fresh post-registration send"
+        );
+
+        // Advance the clock so a tick-based model would treat any
+        // subsequently-processed ack as "post-registration" contact.
+        c.tick().unwrap();
+        let _ = c.ready();
+
+        // The delayed ack for the PRE-registration send arrives. It must
+        // NOT release the read: it only brings ack_count[2] up to the
+        // barrier (1), not past it.
+        c.step(2, success_resp(term)).unwrap();
+        assert_eq!(c.ack_count.get(&2).copied(), Some(1));
+        assert!(
+            c.ready().reads.is_empty(),
+            "an ack for a pre-registration send must not release the read"
+        );
+        assert_eq!(c.pending_reads.len(), 1, "read must remain pending");
+
+        // The ack for the post-registration (forced) send arrives too:
+        // ack_count[2] now exceeds the barrier, proving peer 2 affirmed
+        // this leader's authority via a send made after the read began.
+        // Self + peer 2 form a quorum of 2/3.
+        c.step(2, success_resp(term)).unwrap();
+        assert_eq!(c.ack_count.get(&2).copied(), Some(2));
+        let r = c.ready();
+        assert_eq!(r.reads, vec![77]);
     }
 }

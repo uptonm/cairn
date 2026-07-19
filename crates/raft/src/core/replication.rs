@@ -63,6 +63,7 @@ impl<S: RaftStorage> RaftCore<S> {
         let entries = self.storage.entries_from(ni);
         let sent_up_to = prev + entries.len() as LogIndex;
         self.inflight.entry(peer).or_default().push_back(sent_up_to);
+        *self.send_count.entry(peer).or_default() += 1;
 
         let req = AppendEntriesReq {
             term: self.current_term(),
@@ -223,10 +224,10 @@ impl<S: RaftStorage> RaftCore<S> {
         }
         // A reply from an OLDER term is stale — it can't attest to
         // anything about this leader's current term, so it must not touch
-        // last_contact_tick/match_index/next_index/inflight, nor trigger
-        // commit advancement or a read release. Only a same-term reply
-        // proceeds past this point (standard Raft rule: ignore replies
-        // whose term doesn't match the term the request was sent in).
+        // ack_count/match_index/next_index/inflight, nor trigger commit
+        // advancement or a read release. Only a same-term reply proceeds
+        // past this point (standard Raft rule: ignore replies whose term
+        // doesn't match the term the request was sent in).
         if resp.term < self.current_term() {
             return Ok(());
         }
@@ -243,7 +244,13 @@ impl<S: RaftStorage> RaftCore<S> {
                 self.match_index.insert(from, match_idx);
                 self.next_index.insert(from, match_idx + 1);
             }
-            self.last_contact_tick.insert(from, self.tick_count);
+            // Distinct same-term successes correspond 1:1 with distinct
+            // sends (no message duplication), so this counter is what lets
+            // read_index.rs prove — by pigeonhole — that a peer acked a
+            // send made after a given read registered rather than merely
+            // processing a reply after that point (see PendingRead::barrier
+            // and maybe_release_reads).
+            *self.ack_count.entry(from).or_default() += 1;
             self.maybe_advance_commit()?;
             // Fresh contact and/or a commit advance may have just satisfied
             // a pending read's release conditions (core/read_index.rs) —

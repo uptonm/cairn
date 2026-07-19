@@ -61,7 +61,12 @@ impl SplitMix64 {
 struct PendingRead {
     token: ReadToken,
     floor: LogIndex,
-    registered_tick: u64,
+    /// Snapshot of `send_count` taken when this read registered — see
+    /// `read_index`/`maybe_release_reads` (core/read_index.rs) for how a
+    /// peer's `ack_count` exceeding its entry here proves that peer
+    /// affirmed this leader's authority via a send made AFTER this read
+    /// began, not merely a reply PROCESSED after it.
+    barrier: BTreeMap<NodeId, u64>,
 }
 
 /// Pure, synchronous, I/O-free Raft consensus step function. All I/O
@@ -99,14 +104,18 @@ pub struct RaftCore<S: RaftStorage> {
     /// advancing it past two overlapping in-flight requests (see the
     /// Task-4 self-review / Task-4 fix-pass-1 report).
     inflight: BTreeMap<NodeId, VecDeque<LogIndex>>,
-    /// Per-peer tick at which the leader last heard a same-term
-    /// AppendEntries success from that peer. Read by read_index.rs's
-    /// quorum-contact gate.
-    last_contact_tick: BTreeMap<NodeId, u64>,
-    /// Ticks elapsed since `RaftCore::new`, incremented once per `tick()`.
-    /// Stamped into `last_contact_tick` and compared against
-    /// `PendingRead::registered_tick` by read_index.rs.
-    tick_count: u64,
+    /// Per-peer count of AppendEntries sent, incremented once per send by
+    /// `send_append_to` (core/replication.rs). Monotonic for the lifetime
+    /// of a leadership term (reset in `become_leader`). `read_index`
+    /// snapshots this as a read's `PendingRead::barrier`.
+    send_count: BTreeMap<NodeId, u64>,
+    /// Per-peer count of same-term successful AppendEntriesResp replies
+    /// processed, incremented once per ack by `handle_append_resp`
+    /// (core/replication.rs). Read by read_index.rs's quorum-contact gate:
+    /// `ack_count[P] > barrier[P]` proves, by pigeonhole, that P acked a
+    /// send made after the read registered — see `maybe_release_reads` for
+    /// the full argument.
+    ack_count: BTreeMap<NodeId, u64>,
     /// Reads registered via `read_index` awaiting release; see
     /// core/read_index.rs.
     pending_reads: Vec<PendingRead>,
@@ -136,8 +145,8 @@ impl<S: RaftStorage> RaftCore<S> {
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
             inflight: BTreeMap::new(),
-            last_contact_tick: BTreeMap::new(),
-            tick_count: 0,
+            send_count: BTreeMap::new(),
+            ack_count: BTreeMap::new(),
             pending_reads: Vec::new(),
             readable_term: None,
             rng,
@@ -150,7 +159,6 @@ impl<S: RaftStorage> RaftCore<S> {
     }
 
     pub fn tick(&mut self) -> Result<()> {
-        self.tick_count += 1;
         match self.role {
             Role::Leader => {
                 self.heartbeat_elapsed += 1;
