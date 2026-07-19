@@ -367,8 +367,8 @@ mod tests {
     };
     use crate::transport::Transport;
     use crate::{
-        AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, LogEntry,
-        Message, RequestVoteReq, RequestVoteResp,
+        AppendEntriesReq, AppendEntriesResp, EntryType, InstallSnapshotReq, InstallSnapshotResp,
+        LogEntry, Message, RequestVoteReq, RequestVoteResp,
     };
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
@@ -414,11 +414,7 @@ mod tests {
                 leader_id: 7,
                 prev_log_index: 10,
                 prev_log_term: 2,
-                entries: vec![LogEntry {
-                    term: 3,
-                    index: 11,
-                    command: b"set x".to_vec(),
-                }],
+                entries: vec![LogEntry::normal(3, 11, b"set x".to_vec())],
                 leader_commit: 9,
             }),
             Message::AppendEntriesResp(AppendEntriesResp {
@@ -432,6 +428,7 @@ mod tests {
                 last_index: 11,
                 last_term: 3,
                 data: b"snapshot".to_vec(),
+                config: b"voters".to_vec(),
             }),
             Message::InstallSnapshotResp(InstallSnapshotResp { term: 4 }),
         ]
@@ -454,16 +451,8 @@ mod tests {
                 prev_log_index: 13,
                 prev_log_term: 5,
                 entries: vec![
-                    LogEntry {
-                        term: 6,
-                        index: 14,
-                        command: Vec::new(),
-                    },
-                    LogEntry {
-                        term: 6,
-                        index: 15,
-                        command: b"second command".to_vec(),
-                    },
+                    LogEntry::normal(6, 14, Vec::new()),
+                    LogEntry::normal(6, 15, b"second command".to_vec()),
                 ],
                 leader_commit: 13,
             }),
@@ -478,6 +467,7 @@ mod tests {
                 last_index: 15,
                 last_term: 6,
                 data: Vec::new(),
+                config: Vec::new(),
             }),
         ]);
         messages
@@ -486,16 +476,43 @@ mod tests {
     #[tokio::test]
     async fn incremental_codec_matches_bincode_for_every_message_variant() {
         for message in codec_messages() {
-            let expected_payload = bincode::serialize(&message).unwrap();
             let payload_len = serialized_frame_len(&message).unwrap();
-            assert_eq!(payload_len as usize, expected_payload.len());
 
-            let (mut encoded, mut encoded_reader) = tokio::io::duplex(expected_payload.len() + 4);
+            let (mut encoded, mut encoded_reader) = tokio::io::duplex(payload_len as usize + 4);
             write_frame(&mut encoded, &message, payload_len, Duration::from_secs(1))
                 .await
                 .unwrap();
-            let mut actual_frame = vec![0; expected_payload.len() + 4];
+            let mut actual_frame = vec![0; payload_len as usize + 4];
             encoded_reader.read_exact(&mut actual_frame).await.unwrap();
+
+            // LogEntry.entry_type is encoded as a compact 1-byte tag by this
+            // hand-rolled codec rather than generic bincode's 4-byte
+            // enum-variant u32 — a deliberate wire-format divergence, scoped
+            // to messages that carry entries. Everything else still matches
+            // bincode byte-for-byte, so only entries-bearing messages fall
+            // back to a self round-trip check instead of a raw-byte
+            // comparison against `bincode::serialize`.
+            let carries_entries = matches!(&message,
+                Message::AppendEntries(request) if !request.entries.is_empty());
+            if carries_entries {
+                let (mut raw_writer, mut raw_reader) = tokio::io::duplex(actual_frame.len());
+                raw_writer.write_all(&actual_frame[4..]).await.unwrap();
+                drop(raw_writer);
+                assert_eq!(
+                    read_message(
+                        &mut raw_reader,
+                        payload_len as usize,
+                        Duration::from_secs(1)
+                    )
+                    .await
+                    .unwrap(),
+                    message
+                );
+                continue;
+            }
+
+            let expected_payload = bincode::serialize(&message).unwrap();
+            assert_eq!(payload_len as usize, expected_payload.len());
             let mut expected_frame = payload_len.to_le_bytes().to_vec();
             expected_frame.extend_from_slice(&expected_payload);
             assert_eq!(actual_frame, expected_frame);
@@ -516,6 +533,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn config_change_entry_survives_codec_encode_decode() {
+        let message = Message::AppendEntries(AppendEntriesReq {
+            term: 4,
+            leader_id: 2,
+            prev_log_index: 3,
+            prev_log_term: 4,
+            entries: vec![LogEntry::config_change(4, 4, b"add-voter 5".to_vec())],
+            leader_commit: 3,
+        });
+
+        let payload_len = serialized_frame_len(&message).unwrap();
+        let (mut encoded, mut encoded_reader) = tokio::io::duplex(payload_len as usize + 4);
+        write_frame(&mut encoded, &message, payload_len, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut frame = vec![0; payload_len as usize + 4];
+        encoded_reader.read_exact(&mut frame).await.unwrap();
+
+        let (mut raw_writer, mut raw_reader) = tokio::io::duplex(payload_len as usize);
+        raw_writer.write_all(&frame[4..]).await.unwrap();
+        drop(raw_writer);
+        let decoded = read_message(
+            &mut raw_reader,
+            payload_len as usize,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(decoded, message);
+        match decoded {
+            Message::AppendEntries(request) => {
+                assert_eq!(request.entries[0].entry_type, EntryType::ConfigChange);
+            }
+            other => panic!("expected AppendEntries, got {other:?}"),
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn sizing_large_command_completes_without_background_scanning() {
         const COMMAND_LEN: usize = 32 * 1024 * 1024;
@@ -525,11 +581,7 @@ mod tests {
             leader_id: 9,
             prev_log_index: 15,
             prev_log_term: 7,
-            entries: vec![LogEntry {
-                term: 8,
-                index: 16,
-                command: vec![0x4d; COMMAND_LEN],
-            }],
+            entries: vec![LogEntry::normal(8, 16, vec![0x4d; COMMAND_LEN])],
             leader_commit: 15,
         });
         let mut sizing = Box::pin(size_message(message));
@@ -544,7 +596,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(payload_len as usize, 52 + 24 + COMMAND_LEN);
+        assert_eq!(payload_len as usize, 52 + 25 + COMMAND_LEN);
         drop(message);
     }
 
@@ -556,11 +608,7 @@ mod tests {
             prev_log_index: 16,
             prev_log_term: 8,
             entries: (0..128)
-                .map(|offset| LogEntry {
-                    term: 9,
-                    index: 17 + offset,
-                    command: Vec::new(),
-                })
+                .map(|offset| LogEntry::normal(9, 17 + offset, Vec::new()))
                 .collect(),
             leader_commit: 16,
         });
@@ -687,6 +735,7 @@ mod tests {
             last_index: 41,
             last_term: 22,
             data: vec![0x5a; 8 * 1024 * 1024],
+            config: b"voters".to_vec(),
         });
         let raw_peer = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
@@ -753,6 +802,7 @@ mod tests {
             last_index: 43,
             last_term: 24,
             data: vec![0x3c; 16 * 1024 * 1024],
+            config: b"voters".to_vec(),
         });
 
         let stalled_result =
@@ -803,6 +853,7 @@ mod tests {
             last_index: 101,
             last_term: 28,
             data: vec![0x6b; 16 * 1024 * 1024],
+            config: b"voters".to_vec(),
         });
 
         sender.send(2, expected.clone()).await.unwrap();
@@ -889,6 +940,7 @@ mod tests {
             last_index: 103,
             last_term: 36,
             data: vec![0x4c; 8 * 1024 * 1024],
+            config: b"voters".to_vec(),
         });
         let sending_transport = Arc::clone(&transport);
         let send = tokio::spawn(async move { sending_transport.send(2, large).await });
@@ -1152,6 +1204,7 @@ mod tests {
             last_index: 113,
             last_term: 58,
             data: vec![0x2a; 4096],
+            config: b"voters".to_vec(),
         });
         let encoded_len = bincode::serialize(&expected).unwrap().len();
 

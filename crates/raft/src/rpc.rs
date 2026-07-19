@@ -48,6 +48,12 @@ pub struct InstallSnapshotReq {
     pub last_index: LogIndex,
     pub last_term: Term,
     pub data: Vec<u8>,
+    /// The encoded voter set (`core::membership::encode_voters`) as of this
+    /// snapshot. Carrying the configuration alongside the state-machine
+    /// bytes lets the receiving follower adopt the correct membership even
+    /// though the `ConfigChange` entry that produced it may have already
+    /// been compacted out of the sender's log.
+    pub config: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -90,11 +96,7 @@ mod tests {
                 leader_id: 7,
                 prev_log_index: 10,
                 prev_log_term: 2,
-                entries: vec![LogEntry {
-                    term: 3,
-                    index: 11,
-                    command: b"set x".to_vec(),
-                }],
+                entries: vec![LogEntry::config_change(3, 11, b"set x".to_vec())],
                 leader_commit: 9,
             }),
             Message::AppendEntriesResp(AppendEntriesResp {
@@ -108,6 +110,7 @@ mod tests {
                 last_index: 11,
                 last_term: 3,
                 data: b"snapshot".to_vec(),
+                config: b"voters".to_vec(),
             }),
             Message::InstallSnapshotResp(InstallSnapshotResp { term: 4 }),
         ];
@@ -117,5 +120,14 @@ mod tests {
             let decoded = bincode::deserialize::<Message>(&encoded).unwrap();
             assert_eq!(decoded, message);
         }
+    }
+
+    #[test]
+    fn config_change_entry_type_survives_bincode_roundtrip() {
+        let entry = LogEntry::config_change(1, 1, b"add-voter 5".to_vec());
+        let encoded = bincode::serialize(&entry).unwrap();
+        let decoded: LogEntry = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.entry_type, crate::types::EntryType::ConfigChange);
+        assert_eq!(decoded, entry);
     }
 }

@@ -36,13 +36,20 @@ pub(super) fn encoded_payload_len(message: &Message) -> crate::Result<usize> {
             Some(_) => Ok(4 + 8 + 1 + 1 + 8),
             None => Ok(4 + 8 + 1 + 1),
         },
-        Message::InstallSnapshot(request) => checked_add(4 + 8 + 8 + 8 + 8 + 8, request.data.len()),
+        Message::InstallSnapshot(request) => {
+            // variant(4) + term(8) + leader_id(8) + last_index(8) + last_term(8)
+            // + data-len-prefix(8) + data + config-len-prefix(8) + config
+            let len = checked_add(4 + 8 + 8 + 8 + 8 + 8, request.data.len())?;
+            checked_add(checked_add(len, 8)?, request.config.len())
+        }
         Message::InstallSnapshotResp(_) => Ok(4 + 8),
     }
 }
 
 pub(super) fn add_log_entry_len(len: usize, entry: &LogEntry) -> crate::Result<usize> {
-    checked_add(checked_add(len, 24)?, entry.command.len())
+    // term(8) + index(8) + command length prefix(8) + entry_type(1) = 25,
+    // plus the variable-length command bytes themselves.
+    checked_add(checked_add(len, 25)?, entry.command.len())
 }
 
 fn checked_add(left: usize, right: usize) -> crate::Result<usize> {
@@ -118,6 +125,7 @@ where
             last_index: frame.read_u64().await?,
             last_term: frame.read_u64().await?,
             data: frame.read_bytes().await?,
+            config: frame.read_bytes().await?,
         }),
         5 => Message::InstallSnapshotResp(InstallSnapshotResp {
             term: frame.read_u64().await?,
@@ -258,7 +266,8 @@ where
             write_u64(writer, request.leader_id, idle_timeout).await?;
             write_u64(writer, request.last_index, idle_timeout).await?;
             write_u64(writer, request.last_term, idle_timeout).await?;
-            write_bytes(writer, &request.data, idle_timeout).await
+            write_bytes(writer, &request.data, idle_timeout).await?;
+            write_bytes(writer, &request.config, idle_timeout).await
         }
         Message::InstallSnapshotResp(response) => {
             write_u32(writer, 5, idle_timeout).await?;
@@ -277,7 +286,8 @@ where
 {
     write_u64(writer, entry.term, idle_timeout).await?;
     write_u64(writer, entry.index, idle_timeout).await?;
-    write_bytes(writer, &entry.command, idle_timeout).await
+    write_bytes(writer, &entry.command, idle_timeout).await?;
+    write_u8(writer, entry.entry_type.to_byte(), idle_timeout).await
 }
 
 async fn write_bytes<W>(writer: &mut W, bytes: &[u8], idle_timeout: Duration) -> crate::Result<()>
@@ -407,7 +417,7 @@ where
     }
 
     async fn read_log_entries(&mut self) -> crate::Result<Vec<LogEntry>> {
-        const MIN_LOG_ENTRY_BYTES: usize = 24;
+        const MIN_LOG_ENTRY_BYTES: usize = 25;
         const TRAILING_LEADER_COMMIT_BYTES: usize = 8;
 
         let count = self.read_u64().await?;
@@ -430,11 +440,17 @@ where
             )
         })?;
         for _ in 0..count {
-            entries.push(LogEntry {
-                term: self.read_u64().await?,
-                index: self.read_u64().await?,
-                command: self.read_bytes().await?,
-            });
+            let term = self.read_u64().await?;
+            let index = self.read_u64().await?;
+            let command = self.read_bytes().await?;
+            let entry = match self.read_u8().await? {
+                0 => LogEntry::normal(term, index, command),
+                1 => LogEntry::config_change(term, index, command),
+                invalid => {
+                    return Err(corruption(format!("invalid log entry type byte {invalid}")));
+                }
+            };
+            entries.push(entry);
         }
         Ok(entries)
     }

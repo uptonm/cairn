@@ -1,6 +1,12 @@
 use crate::error::{Error, Result};
 use crate::types::{HardState, LogEntry, LogIndex, SnapshotMeta, Term};
 
+/// `(snapshot metadata, state-machine bytes, encoded voter set)` — what
+/// `RaftStorage::read_snapshot` returns for the latest saved snapshot. The
+/// voter set travels with the snapshot because it's part of the snapshot's
+/// state, not just the state machine's: see `RaftStorage::save_snapshot`.
+pub type StoredSnapshot = (SnapshotMeta, Vec<u8>, Vec<u8>);
+
 pub trait RaftStorage {
     fn hard_state(&self) -> HardState;
     fn save_hard_state(&mut self, hs: &HardState) -> Result<()>;
@@ -11,6 +17,21 @@ pub trait RaftStorage {
     fn snapshot_meta(&self) -> SnapshotMeta;
     fn append(&mut self, entries: &[LogEntry]) -> Result<()>;
     fn truncate_suffix(&mut self, index: LogIndex) -> Result<()>;
+    /// Persist `(meta, data, config)` as the latest snapshot and compact the
+    /// log to that base. `config` is the encoded voter set as of `meta`
+    /// (see `core::membership::encode_voters`) — the configuration is part
+    /// of the snapshot's state, not just the state machine's, so a restart
+    /// or a follower installing this snapshot can recover the correct
+    /// membership even after the `ConfigChange` entry that produced it has
+    /// been compacted out of the log. Entries with `index <= meta.last_index`
+    /// are dropped; entries beyond it are kept only if they stay contiguous
+    /// from `meta.last_index + 1`, otherwise the whole remaining log is
+    /// cleared (a snapshot supersedes a shorter/divergent log). Rejects a
+    /// snapshot older than the one already stored.
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8], config: &[u8]) -> Result<()>;
+    /// The latest saved snapshot as `(meta, data, config)`, or `None` if
+    /// none has ever been saved.
+    fn read_snapshot(&self) -> Result<Option<StoredSnapshot>>;
 }
 
 #[derive(Default)]
@@ -18,6 +39,15 @@ pub struct MemStorage {
     hs: HardState,
     entries: Vec<LogEntry>,
     snapshot: SnapshotMeta,
+    /// The snapshot's state-machine bytes. May legitimately be empty (an
+    /// empty state machine still snapshots), so it is NOT the has-snapshot
+    /// predicate — `snapshot.last_index == 0` is (a real snapshot always has
+    /// `last_index >= 1`; `SnapshotMeta::default()` means "none yet").
+    snapshot_data: Vec<u8>,
+    /// The encoded voter set as of `snapshot`, persisted alongside the
+    /// snapshot's state-machine bytes so membership survives compaction and
+    /// restart. See `save_snapshot`.
+    snapshot_config: Vec<u8>,
 }
 
 impl RaftStorage for MemStorage {
@@ -93,19 +123,45 @@ impl RaftStorage for MemStorage {
         self.entries.retain(|e| e.index < index);
         Ok(())
     }
+
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8], config: &[u8]) -> Result<()> {
+        if meta.last_index < self.snapshot.last_index {
+            return Err(Error::Corruption(format!(
+                "snapshot cannot move backwards: current base {}, got {}",
+                self.snapshot.last_index, meta.last_index
+            )));
+        }
+        let contiguous = self.entries.iter().any(|e| e.index == meta.last_index + 1);
+        if contiguous {
+            self.entries.retain(|e| e.index > meta.last_index);
+        } else {
+            self.entries.clear();
+        }
+        self.snapshot = meta;
+        self.snapshot_data = data.to_vec();
+        self.snapshot_config = config.to_vec();
+        Ok(())
+    }
+
+    fn read_snapshot(&self) -> Result<Option<StoredSnapshot>> {
+        if self.snapshot.last_index == 0 {
+            return Ok(None);
+        }
+        Ok(Some((
+            self.snapshot,
+            self.snapshot_data.clone(),
+            self.snapshot_config.clone(),
+        )))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LogEntry;
+    use crate::types::{EntryType, LogEntry};
 
     fn e(term: Term, index: LogIndex) -> LogEntry {
-        LogEntry {
-            term,
-            index,
-            command: vec![],
-        }
+        LogEntry::normal(term, index, vec![])
     }
 
     #[test]
@@ -127,6 +183,15 @@ mod tests {
         assert_eq!(s.term(3).unwrap(), Some(2));
         assert_eq!(s.term(4).unwrap(), None);
         assert_eq!(s.entries_from(2), vec![e(1, 2), e(2, 3)]);
+    }
+
+    #[test]
+    fn config_change_entry_survives_append_and_read_back() {
+        let mut s = MemStorage::default();
+        let entry = LogEntry::config_change(1, 1, b"add-voter 5".to_vec());
+        s.append(std::slice::from_ref(&entry)).unwrap();
+        assert_eq!(s.entries_from(1), vec![entry.clone()]);
+        assert_eq!(s.entries_from(1)[0].entry_type, EntryType::ConfigChange);
     }
 
     #[test]
@@ -155,5 +220,121 @@ mod tests {
         };
         s.save_hard_state(&hs).unwrap();
         assert_eq!(s.hard_state(), hs);
+    }
+
+    #[test]
+    fn save_and_read_snapshot_compacts_log() {
+        let mut s = MemStorage::default();
+        s.append(&[e(1, 1), e(1, 2), e(1, 3)]).unwrap();
+        s.save_snapshot(
+            SnapshotMeta {
+                last_index: 2,
+                last_term: 1,
+            },
+            b"snap",
+            b"cfg",
+        )
+        .unwrap();
+        assert_eq!(
+            s.snapshot_meta(),
+            SnapshotMeta {
+                last_index: 2,
+                last_term: 1
+            }
+        );
+        assert_eq!(
+            s.read_snapshot().unwrap(),
+            Some((
+                SnapshotMeta {
+                    last_index: 2,
+                    last_term: 1
+                },
+                b"snap".to_vec(),
+                b"cfg".to_vec()
+            ))
+        );
+        // entries <= 2 dropped; entry 3 (contiguous from 3) retained
+        assert_eq!(s.last_index(), 3);
+        assert_eq!(s.term(2).unwrap(), Some(1)); // boundary term from snapshot
+        assert_eq!(s.term(3).unwrap(), Some(1));
+        assert_eq!(s.entries_from(3), vec![e(1, 3)]);
+    }
+
+    #[test]
+    fn snapshot_superseding_a_shorter_log_clears_it() {
+        let mut s = MemStorage::default();
+        s.append(&[e(1, 1)]).unwrap();
+        s.save_snapshot(
+            SnapshotMeta {
+                last_index: 5,
+                last_term: 2,
+            },
+            b"x",
+            b"cfg",
+        )
+        .unwrap(); // base beyond log
+        assert_eq!(s.last_index(), 5); // no entries; base is the snapshot
+        assert_eq!(s.entries_from(1), vec![]);
+        assert_eq!(s.term(5).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn no_snapshot_reads_back_as_none() {
+        let s = MemStorage::default();
+        assert_eq!(s.read_snapshot().unwrap(), None);
+    }
+
+    #[test]
+    fn empty_payload_snapshot_is_still_a_snapshot() {
+        // The has-snapshot predicate must key off the metadata, not the
+        // state-machine payload: a legitimate snapshot can have empty `data`
+        // (an empty state machine) while still carrying a real config that
+        // must survive. Keying off `data.is_empty()` would read this back as
+        // `None` and silently discard the config.
+        let mut s = MemStorage::default();
+        s.save_snapshot(
+            SnapshotMeta {
+                last_index: 3,
+                last_term: 2,
+            },
+            b"",
+            b"cfg",
+        )
+        .unwrap();
+        assert_eq!(
+            s.read_snapshot().unwrap(),
+            Some((
+                SnapshotMeta {
+                    last_index: 3,
+                    last_term: 2
+                },
+                Vec::new(),
+                b"cfg".to_vec()
+            ))
+        );
+    }
+
+    #[test]
+    fn snapshot_cannot_move_backwards() {
+        let mut s = MemStorage::default();
+        s.save_snapshot(
+            SnapshotMeta {
+                last_index: 5,
+                last_term: 1,
+            },
+            b"a",
+            b"cfg",
+        )
+        .unwrap();
+        assert!(s
+            .save_snapshot(
+                SnapshotMeta {
+                    last_index: 3,
+                    last_term: 1
+                },
+                b"b",
+                b"cfg"
+            )
+            .is_err());
     }
 }

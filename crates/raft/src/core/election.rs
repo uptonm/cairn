@@ -2,12 +2,12 @@ use super::*;
 use crate::rpc::{RequestVoteReq, RequestVoteResp};
 
 impl<S: RaftStorage> RaftCore<S> {
-    /// Number of votes (including our own) needed to win an election over
-    /// `config.peers` (which includes self). Also the majority threshold
-    /// `maybe_advance_commit` (replication.rs) uses for `match_index`
-    /// counting — same cluster, same majority definition.
+    /// Number of votes (including our own, if we're currently a voter)
+    /// needed to win an election over the live `voters` set. Also the
+    /// majority threshold `maybe_advance_commit` (replication.rs) uses for
+    /// `match_index` counting — same cluster, same majority definition.
     pub(super) fn quorum(&self) -> usize {
-        self.config.peers.len() / 2 + 1
+        self.voters.len() / 2 + 1
     }
 
     /// Becomes a pre-candidate and broadcasts a pre-vote `RequestVote` to
@@ -23,7 +23,9 @@ impl<S: RaftStorage> RaftCore<S> {
         // redirects.
         self.leader_id = None;
         self.votes = BTreeSet::new();
-        self.votes.insert(self.config.id);
+        if self.voters.contains(&self.config.id) {
+            self.votes.insert(self.config.id);
+        }
         let req = RequestVoteReq {
             term: self.current_term() + 1,
             candidate_id: self.config.id,
@@ -32,7 +34,7 @@ impl<S: RaftStorage> RaftCore<S> {
             pre_vote: true,
         };
         let self_id = self.config.id;
-        for &peer in &self.config.peers {
+        for &peer in &self.voters {
             if peer != self_id {
                 self.outbox.push((peer, Message::RequestVote(req.clone())));
             }
@@ -61,7 +63,9 @@ impl<S: RaftStorage> RaftCore<S> {
 
         self.role = Role::Candidate;
         self.votes = BTreeSet::new();
-        self.votes.insert(self.config.id);
+        if self.voters.contains(&self.config.id) {
+            self.votes.insert(self.config.id);
+        }
         self.reset_election_timer();
 
         let req = RequestVoteReq {
@@ -72,7 +76,7 @@ impl<S: RaftStorage> RaftCore<S> {
             pre_vote: false,
         };
         let self_id = self.config.id;
-        for &peer in &self.config.peers {
+        for &peer in &self.voters {
             if peer != self_id {
                 self.outbox.push((peer, Message::RequestVote(req.clone())));
             }
@@ -117,18 +121,14 @@ impl<S: RaftStorage> RaftCore<S> {
 
         let self_id = self.config.id;
         let next = self.storage.last_index() + 1;
-        for &peer in &self.config.peers {
+        for &peer in &self.voters {
             if peer != self_id {
                 self.next_index.insert(peer, next);
                 self.match_index.insert(peer, 0);
             }
         }
 
-        let noop = LogEntry {
-            term: self.current_term(),
-            index: next,
-            command: Vec::new(),
-        };
+        let noop = LogEntry::normal(self.current_term(), next, Vec::new());
         self.storage.append(std::slice::from_ref(&noop))?;
         self.next_index.insert(self_id, next + 1);
         self.match_index.insert(self_id, next);
@@ -339,12 +339,7 @@ mod tests {
     #[test]
     fn rejects_behind_candidate() {
         let mut s = MemStorage::default();
-        s.append(&[LogEntry {
-            term: 2,
-            index: 1,
-            command: vec![],
-        }])
-        .unwrap();
+        s.append(&[LogEntry::normal(2, 1, vec![])]).unwrap();
         let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), s).unwrap();
         c.step(
             1,

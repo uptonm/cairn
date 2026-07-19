@@ -17,7 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cairn_raft::{Config, LogEntry, LogIndex, MemStorage, Message, NodeId, RaftCore, Role, Term};
+use cairn_raft::{
+    ConfChange, Config, LogEntry, LogIndex, MemStorage, Message, NodeId, RaftCore, Role,
+    SnapshotMeta, Term,
+};
 
 /// Hand-rolled deterministic PRNG for the harness's own fault decisions
 /// (currently: which in-flight message to deliver next, when `reorder` is
@@ -102,6 +105,27 @@ struct Cluster {
     /// than merely running with the flag set on a queue that never had more
     /// than one message in it.
     non_fifo_deliveries: usize,
+    /// Timing/seed the cluster was constructed with, retained so
+    /// `register_node` can bootstrap a mid-run joiner with the exact same
+    /// `Config` shape every original node got (see `Cluster::new`'s comment
+    /// on why every node shares one base seed).
+    election_timeout: u64,
+    heartbeat_interval: u64,
+    seed: u64,
+    /// The membership the harness currently expects to be live, mutated
+    /// only by `add_voter`/`remove_voter` after a successful
+    /// `propose_conf_change`. This is what the voter-aware invariant
+    /// checks (`assert_leader_completeness_containment`,
+    /// `assert_membership_converged`) hold nodes to — NOT `self.ids`, which
+    /// only ever grows and never reflects a removal.
+    expected_voters: BTreeSet<NodeId>,
+    /// Every node id, in order, that has ever processed a `Ready.restore`
+    /// (i.e. genuinely installed a leader's `InstallSnapshot`, not merely
+    /// backfilled via ordinary `AppendEntries`). `snapshot_catch_up` and
+    /// `kill_and_replace` assert against this directly to prove they
+    /// actually exercised the InstallSnapshot path, not just that the node
+    /// somehow ended up caught up.
+    restore_events: Vec<NodeId>,
 }
 
 impl Cluster {
@@ -145,7 +169,42 @@ impl Cluster {
             leader_snapshots: Vec::new(),
             committed_by_index: BTreeMap::new(),
             non_fifo_deliveries: 0,
+            election_timeout,
+            heartbeat_interval,
+            seed,
+            expected_voters: ids.iter().copied().collect(),
+            restore_events: Vec::new(),
         }
+    }
+
+    /// Registers a brand-new node mid-run (fresh `MemStorage`, empty log),
+    /// extending every parallel vec + `index_of`. `peers` bootstraps the
+    /// joiner's own `Config::peers` — only consulted by `recompute_voters`
+    /// as the last-resort fallback before any config entry or snapshot
+    /// exists on this node (see membership.rs's doc comment), so callers
+    /// pass the TARGET membership (not the pre-join one) to keep the
+    /// joiner's own quorum math sane from tick 1, before it ever hears from
+    /// a leader.
+    fn register_node(&mut self, id: NodeId, peers: Vec<NodeId>) {
+        assert!(
+            !self.index_of.contains_key(&id),
+            "register_node({id}): a node with this id is already registered"
+        );
+        let config = Config {
+            id,
+            peers,
+            election_timeout: self.election_timeout,
+            heartbeat_interval: self.heartbeat_interval,
+            seed: self.seed,
+        };
+        let core = RaftCore::new(config.clone(), MemStorage::default())
+            .expect("RaftCore::new must succeed with fresh MemStorage");
+        self.index_of.insert(id, self.ids.len());
+        self.ids.push(id);
+        self.configs.push(config);
+        self.nodes.push(Some(core));
+        self.crashed_storage.push(None);
+        self.applied.push(Vec::new());
     }
 
     fn reachable(&self, a: NodeId, b: NodeId) -> bool {
@@ -238,17 +297,28 @@ impl Cluster {
         });
     }
 
-    /// Drains `idx`'s `ready()`: files applied entries, enqueues outbound
-    /// messages (subject to partition/block-appends filtering at send
-    /// time), and records a leader snapshot if `idx` is currently leading.
-    /// Reads are intentionally ignored — read-linearizability is out of
-    /// scope for Task 7's safety invariants (Plan C treats it as optional).
+    /// Drains `idx`'s `ready()`: installs a pending snapshot restore (if
+    /// any), files applied entries, enqueues outbound messages (subject to
+    /// partition/block-appends filtering at send time), and records a
+    /// leader snapshot if `idx` is currently leading. Reads are
+    /// intentionally ignored — read-linearizability is out of scope for
+    /// Task 7's safety invariants (Plan C treats it as optional).
+    ///
+    /// `restore` is processed BEFORE `apply`, in that order, within this
+    /// one drained batch — the explicit Plan E driver contract: a follower
+    /// that just installed a snapshot must have its state machine caught up
+    /// to the snapshot's `last_index` before any further `apply` entries
+    /// (which start at `last_index + 1`) are filed, or `record_applied`'s
+    /// contiguity invariant would see a gap.
     fn drain_ready(&mut self, idx: usize) {
         let self_id = self.ids[idx];
         let ready = self.nodes[idx]
             .as_mut()
             .expect("drain_ready called on a crashed node")
             .ready();
+        if let Some((meta, data)) = ready.restore {
+            self.apply_restore(idx, meta, data);
+        }
         for entry in ready.apply {
             self.record_applied(idx, entry);
         }
@@ -260,6 +330,67 @@ impl Cluster {
         }
         let _ = ready.reads; // deliberately unobserved, see doc comment above
         self.record_leader_if_leading(idx);
+    }
+
+    /// Installs a follower's `Ready.restore` into the harness's tracked
+    /// applied-log projection for node `idx`. The sim's "state machine" is
+    /// the applied-log projection itself, so a snapshot's `data` blob is
+    /// modeled as exactly `bincode::serialize(&Vec<LogEntry>)` of the
+    /// leader's applied prefix at compaction time (see `compact_leader`) —
+    /// `bincode` is deterministic and `LogEntry` already derives
+    /// `Serialize`/`Deserialize`, so no hand-rolled encoding is needed.
+    fn apply_restore(&mut self, idx: usize, meta: SnapshotMeta, data: Vec<u8>) {
+        let snapshot: Vec<LogEntry> = bincode::deserialize(&data).unwrap_or_else(|e| {
+            panic!(
+                "node {}: Ready.restore's data did not decode as Vec<LogEntry>: {e}",
+                self.ids[idx]
+            )
+        });
+        assert_eq!(
+            snapshot.len() as LogIndex,
+            meta.last_index,
+            "node {}: restored snapshot has {} entries but meta.last_index is {}",
+            self.ids[idx],
+            snapshot.len(),
+            meta.last_index
+        );
+        for (k, entry) in snapshot.iter().enumerate() {
+            assert_eq!(
+                entry.index,
+                k as LogIndex + 1,
+                "node {}: restored snapshot is non-contiguous at position {k} (entry.index {})",
+                self.ids[idx],
+                entry.index
+            );
+        }
+        // State-machine safety across the snapshot boundary: wherever this
+        // node's own prior applied prefix overlaps the restored snapshot,
+        // the content must agree exactly. The core only ever installs a
+        // snapshot strictly ahead of the follower's commit_index, so in
+        // practice the prior prefix is always shorter than or equal to the
+        // snapshot — but check the overlap regardless rather than assume it.
+        let prior = self.applied[idx].clone();
+        for k in 0..snapshot.len().min(prior.len()) {
+            assert_eq!(
+                snapshot[k],
+                prior[k],
+                "node {}: restored snapshot CONTRADICTS its own already-applied entry at index \
+                 {} — state machine safety violation across a snapshot boundary",
+                self.ids[idx],
+                k + 1
+            );
+        }
+        // A restored snapshot must never contradict what was committed
+        // elsewhere in the cluster either.
+        for entry in &snapshot {
+            self.record_committed(entry.clone());
+        }
+        self.applied[idx] = snapshot;
+        self.restore_events.push(self.ids[idx]);
+    }
+
+    fn restored_nodes(&self) -> &[NodeId] {
+        &self.restore_events
     }
 
     fn tick_all(&mut self) {
@@ -408,6 +539,89 @@ impl Cluster {
         self.non_fifo_deliveries
     }
 
+    /// Snapshots `leader`'s applied prefix through `up_to`. Models the
+    /// snapshot's opaque `data` blob as
+    /// `bincode::serialize(&applied[..up_to])` (see `apply_restore`'s doc
+    /// comment for why that's the right fixture-side model of "the state
+    /// machine"), then calls `RaftCore::compact`, which enforces `up_to` is
+    /// in `(current_snapshot_base, last_applied]` — a well-formed scenario
+    /// must never violate that range, so a rejection here is an `.expect`,
+    /// not a `Result` the caller has to handle.
+    fn compact_leader(&mut self, leader: NodeId, up_to: LogIndex) {
+        let idx = self.index_of[&leader];
+        let applied_prefix = &self.applied[idx];
+        assert!(
+            applied_prefix.len() as LogIndex >= up_to,
+            "compact_leader({leader}, {up_to}): leader has only applied {} entries",
+            applied_prefix.len()
+        );
+        let data = bincode::serialize(&applied_prefix[..up_to as usize])
+            .expect("bincode serialization of [LogEntry] must not fail");
+        self.nodes[idx]
+            .as_mut()
+            .expect("compact_leader target must be alive")
+            .compact(up_to, data)
+            .expect("compact must succeed for a well-formed scenario — index out of range");
+        self.drain_ready(idx);
+    }
+
+    /// Proposes `change` against whichever node currently claims leadership
+    /// among `self.expected_voters`, retrying across a bounded round budget
+    /// — mirroring `propose_on_current_leader` — whenever there's no leader
+    /// yet, or the leader refuses (`Ok(None)`: e.g. a prior conf change is
+    /// still in flight, or this is a same-membership no-op).
+    fn propose_conf_change_on_current_leader(&mut self, change: ConfChange) {
+        let expected: Vec<NodeId> = self.expected_voters.iter().copied().collect();
+        for _ in 0..200 {
+            if let Some(leader) = self.current_leaders_among(&expected).first().copied() {
+                let idx = self.index_of[&leader];
+                let result = self.nodes[idx]
+                    .as_mut()
+                    .expect("leader must be alive")
+                    .propose_conf_change(change)
+                    .expect("propose_conf_change must not error");
+                self.drain_ready(idx);
+                if result.is_some() {
+                    return;
+                }
+            }
+            self.run(1);
+        }
+        panic!("propose_conf_change({change:?}) never succeeded within budget");
+    }
+
+    /// Grows the live membership by one voter. Registers `id` as a fresh
+    /// node FIRST (bootstrapped to the TARGET membership, i.e. the current
+    /// `expected_voters` plus `id`, so the joiner's own quorum math is sane
+    /// from tick 1 — see `register_node`), so the leader's subsequent
+    /// AppendEntries/InstallSnapshot to it are deliverable at all
+    /// (`deliver_one` silently drops messages to an unknown recipient).
+    /// Then proposes `AddVoter(id)` on the current leader, and settles the
+    /// cluster before returning — Task 6's "each committed + caught up
+    /// before the next": the caller can immediately treat `id` as a fully
+    /// caught-up member.
+    fn add_voter(&mut self, id: NodeId) {
+        let mut target = self.expected_voters.clone();
+        target.insert(id);
+        self.register_node(id, target.into_iter().collect());
+
+        self.propose_conf_change_on_current_leader(ConfChange::AddVoter(id));
+        self.expected_voters.insert(id);
+        self.settle();
+    }
+
+    /// Shrinks the live membership by one voter: proposes `RemoveVoter(id)`
+    /// on the current leader, then settles. `id` stays registered and kept
+    /// running (a real deployment can't force a removed process to stop) —
+    /// see `assert_leader_completeness_containment`'s doc comment for how a
+    /// removed-but-live node is tolerated without being allowed to become
+    /// the settled leader.
+    fn remove_voter(&mut self, id: NodeId) {
+        self.propose_conf_change_on_current_leader(ConfChange::RemoveVoter(id));
+        self.expected_voters.remove(&id);
+        self.settle();
+    }
+
     /// Heals any active partition, then drives `tick_all` + `deliver_all`
     /// rounds until the cluster is quiescent: two consecutive full rounds in
     /// a row produce no growth in any node's applied log (and, trivially,
@@ -469,6 +683,7 @@ impl Cluster {
         self.settle();
         self.assert_invariants();
         self.assert_leader_completeness_containment();
+        self.assert_membership_converged();
     }
 
     /// Invariant 1 — ELECTION SAFETY: at most one leader per term. Checked
@@ -567,31 +782,76 @@ impl Cluster {
     }
 
     /// Invariant 4 — LEADER COMPLETENESS, the real CONTAINMENT check: after
-    /// the cluster has `settle()`d to exactly one current leader, that
-    /// leader's applied log must CONTAIN every entry ever committed over the
-    /// whole run (`committed_by_index`, built in `record_committed`), at the
-    /// correct index, byte-identical. Unlike
+    /// the cluster has `settle()`d to exactly one current leader AMONG
+    /// `expected_voters`, that leader's applied log must CONTAIN every
+    /// entry ever committed over the whole run (`committed_by_index`, built
+    /// in `record_committed`), at the correct index, byte-identical. Unlike
     /// `assert_leader_completeness_pairwise`, this cannot be fooled by a
     /// leader whose applied log is simply too SHORT: every committed index
     /// is checked explicitly, so a missing index is a `None` from
     /// `leader_applied.get(pos)` rather than a loop bound that silently
     /// never reaches it.
     ///
-    /// Requires exactly one current leader — meaningless (and asserted
-    /// against) otherwise, since "the leader" wouldn't be well defined.
+    /// Checked over `expected_voters`, NOT `self.ids`: a node the harness
+    /// has removed (`remove_voter`) stays registered and running — a real
+    /// deployment can't force a removed process to stop — and Raft's
+    /// single-server membership scheme has no mechanism to stop a removed
+    /// node from campaigning (it can still win votes from stale peers on
+    /// log up-to-dateness alone; see the Raft dissertation §4.2.2). Such a
+    /// node is tolerated as briefly disruptive, but must never be counted
+    /// as, or required to be, THE settled leader — so "exactly one leader"
+    /// is required only among the membership the harness currently expects
+    /// to be live.
+    ///
+    /// Requires exactly one current leader among `expected_voters` —
+    /// meaningless (and asserted against) otherwise, since "the leader"
+    /// wouldn't be well defined.
     fn assert_leader_completeness_containment(&self) {
-        let leaders = self.current_leaders();
+        let expected: Vec<NodeId> = self.expected_voters.iter().copied().collect();
+        let leaders = self.current_leaders_among(&expected);
         assert_eq!(
             leaders.len(),
             1,
             "assert_leader_completeness_containment requires the cluster to have settled to \
-             exactly one current leader; found {}: {leaders:?}",
+             exactly one current leader among expected_voters {expected:?}; found {}: \
+             {leaders:?}",
             leaders.len()
         );
         let leader = leaders[0];
         if let Err(violation) = check_containment(&self.committed_by_index, self.applied_of(leader))
         {
             panic!("LEADER COMPLETENESS VIOLATED for leader {leader}: {violation}");
+        }
+    }
+
+    /// Voter-aware companion invariant, checked after every scenario
+    /// settles (see `assert_invariants_after_settle`): every node the
+    /// harness currently expects to be a voter must have actually
+    /// converged to that exact membership — `core.voters()` (the ground
+    /// truth every quorum/peer-iteration decision inside `RaftCore` is made
+    /// against) must equal `expected_voters`, not a stale bootstrap
+    /// config or a mid-flight change. Pairwise applied-log agreement across
+    /// ALL registered nodes (not just expected voters) is already covered
+    /// by `assert_log_agreement`, so it isn't repeated here.
+    fn assert_membership_converged(&self) {
+        for &id in &self.expected_voters {
+            let idx = self.index_of[&id];
+            // A node the harness never restarted (e.g. `leader_crash_reelection`
+            // crashes the leader and moves on without ever calling
+            // `remove_voter`) has no core left to query and plays no further
+            // part in convergence — skip it rather than treat "still
+            // registered as an expected voter, but permanently crashed" as a
+            // membership-convergence failure.
+            let Some(node) = self.nodes[idx].as_ref() else {
+                continue;
+            };
+            let live: BTreeSet<NodeId> = node.voters().into_iter().collect();
+            assert_eq!(
+                live, self.expected_voters,
+                "node {id}'s live voter set has not converged to the expected membership \
+                 {:?}, found {live:?}",
+                self.expected_voters
+            );
         }
     }
 }
@@ -891,6 +1151,235 @@ fn restart_persistence() {
     cluster.assert_invariants_after_settle();
 }
 
+const IDS5: [NodeId; 5] = [1, 2, 3, 4, 5];
+
+/// Log compaction + InstallSnapshot catch-up (Task 6): a follower falls far
+/// enough behind, WHILE compaction happens on the majority, that its needed
+/// entries are structurally gone from the leader's log by the time it
+/// reconnects — the only possible path back to convergence is a genuine
+/// `InstallSnapshot`, not ordinary `AppendEntries` conflict backup. Proven
+/// directly (not just inferred from the outcome) via `restored_nodes()`.
+#[test]
+fn snapshot_catch_up() {
+    let mut cluster = Cluster::new(&IDS, 10, 3, 7);
+    elect(&mut cluster, &IDS);
+
+    let majority = [1, 2];
+    let minority = [3];
+    cluster.partition(&majority, &minority);
+    cluster.run(30);
+
+    let majority_leader = elect(&mut cluster, &majority);
+    for cmd in [
+        b"s1".to_vec(),
+        b"s2".to_vec(),
+        b"s3".to_vec(),
+        b"s4".to_vec(),
+    ] {
+        propose_on_current_leader(&mut cluster, &majority, cmd);
+        cluster.run(20);
+    }
+
+    let leader_applied_len = cluster.applied_of(majority_leader).len() as LogIndex;
+    assert!(
+        leader_applied_len >= 4,
+        "scenario setup needs a non-trivial committed prefix to compact away"
+    );
+
+    // Node 3's next_index has been frozen at wherever it was when the
+    // partition began (no message ever reached it to advance it) — well
+    // below the leader's current applied length. Compacting through the
+    // ENTIRE applied prefix guarantees node 3's needed entries no longer
+    // exist anywhere in the leader's log: only InstallSnapshot can recover it.
+    cluster.compact_leader(majority_leader, leader_applied_len);
+
+    assert!(
+        !cluster.restored_nodes().contains(&3),
+        "node 3 must not have restored anything yet — it's still partitioned away"
+    );
+
+    cluster.heal();
+    cluster.run(60);
+
+    assert!(
+        cluster.restored_nodes().contains(&3),
+        "node 3 must have genuinely installed a leader snapshot (Ready.restore) to converge — \
+         its needed entries were structurally compacted away, so ordinary AppendEntries \
+         conflict-backup alone could not have gotten it there"
+    );
+    assert_eq!(
+        cluster.applied_of(3),
+        cluster.applied_of(majority_leader),
+        "node 3 must converge to exactly the majority leader's applied state after healing"
+    );
+
+    cluster.assert_invariants_after_settle();
+}
+
+/// Single-server membership growth (Task 6): 3 -> 4 -> 5 voters, one at a
+/// time, each committed and caught up (via `add_voter`'s internal
+/// `settle()`) before the next change is proposed. Proposes across each
+/// transition to prove the cluster keeps making progress throughout, not
+/// just before/after.
+#[test]
+fn grow_three_to_five() {
+    let mut cluster = Cluster::new(&IDS, 10, 3, 8);
+    elect(&mut cluster, &IDS);
+
+    propose_on_current_leader(&mut cluster, &IDS, b"before-grow".to_vec());
+    cluster.run(20);
+
+    cluster.add_voter(4);
+    let voters4: Vec<NodeId> = vec![1, 2, 3, 4];
+    propose_on_current_leader(&mut cluster, &voters4, b"after-4".to_vec());
+    cluster.run(20);
+
+    cluster.add_voter(5);
+    let voters5: Vec<NodeId> = vec![1, 2, 3, 4, 5];
+    propose_on_current_leader(&mut cluster, &voters5, b"after-5".to_vec());
+    cluster.run(30);
+
+    for &id in &voters5 {
+        let cmds = non_empty_commands(cluster.applied_of(id));
+        assert!(
+            cmds.contains(&b"before-grow".to_vec()),
+            "node {id} must have the pre-growth command"
+        );
+        assert!(
+            cmds.contains(&b"after-4".to_vec()),
+            "node {id} must have the command proposed after growing to 4"
+        );
+        assert!(
+            cmds.contains(&b"after-5".to_vec()),
+            "node {id} must have the command proposed after growing to 5"
+        );
+    }
+
+    // Election safety (at most one leader per term) is checked over the
+    // WHOLE run's leader_observations by assert_invariants_after_settle
+    // below; membership convergence to exactly {1,2,3,4,5} is checked by
+    // assert_membership_converged, also below.
+    cluster.assert_invariants_after_settle();
+}
+
+/// Single-server membership shrink (Task 6): 5 -> 4 -> 3 voters. The first
+/// removal takes an ordinary follower; the second removal specifically
+/// targets the CURRENT LEADER, which must force a clean re-election among
+/// the remaining 3. The removed leader must not linger as A leader anywhere
+/// (asserted cluster-wide below); `assert_leader_completeness_containment`
+/// (via `assert_invariants_after_settle`) independently enforces that a
+/// removed-but-live node is never THE settled leader — see its doc comment.
+#[test]
+fn shrink_five_to_three() {
+    let mut cluster = Cluster::new(&IDS5, 10, 3, 9);
+    elect(&mut cluster, &IDS5);
+
+    propose_on_current_leader(&mut cluster, &IDS5, b"before-shrink".to_vec());
+    cluster.run(20);
+
+    let leader_before = cluster.current_leaders_among(&IDS5)[0];
+    let first_removed = IDS5.into_iter().find(|&id| id != leader_before).unwrap();
+    cluster.remove_voter(first_removed);
+
+    let remaining4: Vec<NodeId> = IDS5.into_iter().filter(|&id| id != first_removed).collect();
+    propose_on_current_leader(&mut cluster, &remaining4, b"after-first-remove".to_vec());
+    cluster.run(20);
+
+    let leader_to_remove = cluster.current_leaders_among(&remaining4)[0];
+    cluster.remove_voter(leader_to_remove);
+
+    let remaining3: Vec<NodeId> = remaining4
+        .into_iter()
+        .filter(|&id| id != leader_to_remove)
+        .collect();
+    let new_leader = elect(&mut cluster, &remaining3);
+    // Discriminating check: exactly one leader CLUSTER-WIDE, and it is the
+    // newly elected one — not the removed node lingering. `assert_ne!` on
+    // `new_leader` alone would be vacuous (`elect` only ever returns an id
+    // from `remaining3`, which excludes `leader_to_remove` by construction).
+    // A removed-but-live node still winning a re-election (Raft dissertation
+    // §4.2.2 disruption — neither RequestVote nor AppendEntries checks sender
+    // membership yet) would surface here as a second leader or as the removed
+    // id, failing this assert instead of slipping through.
+    assert_eq!(
+        cluster.current_leaders(),
+        vec![new_leader],
+        "removing the leader must force a clean re-election among the remaining 3: exactly one \
+         leader cluster-wide, and it must be the newly elected node, not the removed one"
+    );
+
+    propose_on_current_leader(&mut cluster, &remaining3, b"after-leader-remove".to_vec());
+    cluster.run(30);
+
+    for &id in &remaining3 {
+        let cmds = non_empty_commands(cluster.applied_of(id));
+        assert!(cmds.contains(&b"before-shrink".to_vec()));
+        assert!(cmds.contains(&b"after-first-remove".to_vec()));
+        assert!(cmds.contains(&b"after-leader-remove".to_vec()));
+    }
+
+    cluster.assert_invariants_after_settle();
+}
+
+/// Kill-and-replace (Task 6): a follower crashes, the leader compacts its
+/// applied prefix while the crashed node is down, the crashed node is
+/// removed from the voter set, and a brand-new node joins in its place. The
+/// replacement's log starts empty and everything it would need was just
+/// compacted away, so it must catch up via a genuine InstallSnapshot — this
+/// is checked directly via `restored_nodes()`, not merely inferred from the
+/// outcome, exercising the same path `snapshot_catch_up` proves in
+/// isolation, but composed with membership change.
+#[test]
+fn kill_and_replace() {
+    let mut cluster = Cluster::new(&IDS, 10, 3, 10);
+    let leader = elect(&mut cluster, &IDS);
+
+    for cmd in [b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()] {
+        propose_on_current_leader(&mut cluster, &IDS, cmd);
+        cluster.run(20);
+    }
+
+    let victim = IDS.into_iter().find(|&id| id != leader).unwrap();
+    cluster.crash(victim);
+
+    let current_leader = cluster
+        .current_leaders_among(&IDS)
+        .first()
+        .copied()
+        .expect("a leader must still be up with only a non-leader crashed");
+    let leader_applied_len = cluster.applied_of(current_leader).len() as LogIndex;
+    cluster.compact_leader(current_leader, leader_applied_len);
+
+    cluster.remove_voter(victim);
+
+    let replacement: NodeId = 4;
+    cluster.add_voter(replacement);
+
+    assert!(
+        cluster.restored_nodes().contains(&replacement),
+        "the replacement node must have caught up via a genuine InstallSnapshot — everything it \
+         needed was compacted away before it ever joined, so ordinary AppendEntries \
+         conflict-backup alone could not have gotten it there"
+    );
+
+    let remaining: Vec<NodeId> = IDS
+        .into_iter()
+        .filter(|&id| id != victim)
+        .chain(std::iter::once(replacement))
+        .collect();
+    propose_on_current_leader(&mut cluster, &remaining, b"after-replace".to_vec());
+    cluster.run(30);
+
+    for &id in &remaining {
+        assert!(
+            non_empty_commands(cluster.applied_of(id)).contains(&b"after-replace".to_vec()),
+            "node {id} must replicate the post-replacement command"
+        );
+    }
+
+    cluster.assert_invariants_after_settle();
+}
+
 #[test]
 fn determinism() {
     fn run_scenario(seed: u64) -> (NodeId, Vec<Vec<LogEntry>>) {
@@ -930,38 +1419,13 @@ fn determinism() {
 #[test]
 fn containment_check_detects_a_lost_committed_entry() {
     let mut committed = BTreeMap::new();
-    committed.insert(
-        1,
-        LogEntry {
-            term: 1,
-            index: 1,
-            command: b"a".to_vec(),
-        },
-    );
-    committed.insert(
-        2,
-        LogEntry {
-            term: 1,
-            index: 2,
-            command: b"b".to_vec(),
-        },
-    );
-    committed.insert(
-        3,
-        LogEntry {
-            term: 2,
-            index: 3,
-            command: b"c".to_vec(),
-        },
-    );
+    committed.insert(1, LogEntry::normal(1, 1, b"a".to_vec()));
+    committed.insert(2, LogEntry::normal(1, 2, b"b".to_vec()));
+    committed.insert(3, LogEntry::normal(2, 3, b"c".to_vec()));
 
     // Leader's applied log has index 1 only — committed index 2 (and 3) are
     // simply beyond its length, never rewritten, just LOST.
-    let leader_missing_committed_entries = vec![LogEntry {
-        term: 1,
-        index: 1,
-        command: b"a".to_vec(),
-    }];
+    let leader_missing_committed_entries = vec![LogEntry::normal(1, 1, b"a".to_vec())];
 
     let result = check_containment(&committed, &leader_missing_committed_entries);
     assert!(
@@ -972,21 +1436,9 @@ fn containment_check_detects_a_lost_committed_entry() {
 
     // A leader log that HAS every committed index, correctly, must pass.
     let leader_with_everything = vec![
-        LogEntry {
-            term: 1,
-            index: 1,
-            command: b"a".to_vec(),
-        },
-        LogEntry {
-            term: 1,
-            index: 2,
-            command: b"b".to_vec(),
-        },
-        LogEntry {
-            term: 2,
-            index: 3,
-            command: b"c".to_vec(),
-        },
+        LogEntry::normal(1, 1, b"a".to_vec()),
+        LogEntry::normal(1, 2, b"b".to_vec()),
+        LogEntry::normal(2, 3, b"c".to_vec()),
     ];
     assert!(
         check_containment(&committed, &leader_with_everything).is_ok(),

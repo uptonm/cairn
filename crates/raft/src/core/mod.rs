@@ -3,11 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::error::Result;
 use crate::rpc::Message;
 use crate::storage::RaftStorage;
-use crate::types::{HardState, LogEntry, LogIndex, NodeId, Term};
+use crate::types::{HardState, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
 
 mod election;
+mod membership;
 mod read_index;
 mod replication;
+mod snapshot;
+
+pub use membership::ConfChange;
 
 pub type ReadToken = u64;
 
@@ -24,6 +28,7 @@ pub struct Ready {
     pub messages: Vec<(NodeId, Message)>,
     pub apply: Vec<LogEntry>,
     pub reads: Vec<ReadToken>,
+    pub restore: Option<(SnapshotMeta, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +95,15 @@ pub struct RaftCore<S: RaftStorage> {
     election_deadline: u64,
     heartbeat_elapsed: u64,
     votes: BTreeSet<NodeId>,
+    /// The live cluster membership: the set of nodes whose votes/acks count
+    /// toward quorum right now. Derived from the log (`recompute_voters`,
+    /// core/membership.rs) rather than fixed at construction — it tracks
+    /// the highest-index `ConfigChange` entry currently present (effect on
+    /// append, reverted on truncation), falling back to the bootstrap
+    /// `config.peers` when the log holds no config entry. Every quorum
+    /// computation and peer-iteration site uses this, never `config.peers`
+    /// directly, once a config entry exists.
+    voters: BTreeSet<NodeId>,
     next_index: BTreeMap<NodeId, LogIndex>,
     match_index: BTreeMap<NodeId, LogIndex>,
     /// Per-peer FIFO queue of "up-to" indices (`prev_log_index +
@@ -125,6 +139,11 @@ pub struct RaftCore<S: RaftStorage> {
     outbox: Vec<(NodeId, Message)>,
     apply_buf: Vec<LogEntry>,
     reads_buf: Vec<ReadToken>,
+    /// Set when a snapshot arrives that the caller must install into its
+    /// state machine before further applies proceed; drained by `ready()`
+    /// into `Ready.restore`. Populated by `handle_install_snapshot`
+    /// (core/snapshot.rs) on a fresh (non-stale) InstallSnapshot.
+    restore_buf: Option<(SnapshotMeta, Vec<u8>)>,
 }
 
 impl<S: RaftStorage> RaftCore<S> {
@@ -142,6 +161,7 @@ impl<S: RaftStorage> RaftCore<S> {
             election_deadline: 0,
             heartbeat_elapsed: 0,
             votes: BTreeSet::new(),
+            voters: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
             inflight: BTreeMap::new(),
@@ -153,8 +173,15 @@ impl<S: RaftStorage> RaftCore<S> {
             outbox: Vec::new(),
             apply_buf: Vec::new(),
             reads_buf: Vec::new(),
+            restore_buf: None,
         };
         core.reset_election_timer();
+        // Seed from the bootstrap config, then immediately let the log
+        // override it if a config entry is already present — a restart
+        // must honor whatever membership change was last durably appended,
+        // not silently revert to the original bootstrap peers.
+        core.voters = core.config.peers.iter().copied().collect();
+        core.recompute_voters()?;
         Ok(core)
     }
 
@@ -183,6 +210,7 @@ impl<S: RaftStorage> RaftCore<S> {
             messages: std::mem::take(&mut self.outbox),
             apply: std::mem::take(&mut self.apply_buf),
             reads: std::mem::take(&mut self.reads_buf),
+            restore: std::mem::take(&mut self.restore_buf),
         }
     }
 
@@ -215,12 +243,14 @@ impl<S: RaftStorage> RaftCore<S> {
         self.storage
     }
 
-    /// Dispatch skeleton. `InstallSnapshot`/`InstallSnapshotResp` are
-    /// permanently ignored here (snapshot install is out of RaftCore's
-    /// scope).
+    /// Dispatch. `InstallSnapshot`/`InstallSnapshotResp` are routed to
+    /// core/snapshot.rs's handlers, which install/acknowledge a snapshot on
+    /// the follower side and advance replication progress on the leader
+    /// side.
     pub fn step(&mut self, from: NodeId, msg: Message) -> Result<()> {
         match msg {
-            Message::InstallSnapshot(_) | Message::InstallSnapshotResp(_) => Ok(()),
+            Message::InstallSnapshot(req) => self.handle_install_snapshot(from, req),
+            Message::InstallSnapshotResp(resp) => self.handle_install_snapshot_resp(from, resp),
             Message::RequestVote(req) => self.handle_request_vote(from, req),
             Message::RequestVoteResp(resp) => self.handle_vote_resp(from, resp),
             Message::AppendEntries(req) => self.handle_append_entries(from, req),
@@ -413,8 +443,13 @@ mod tests {
         assert_eq!(restarted.last_applied, 0);
     }
 
+    // A valid InstallSnapshot now ACTS (see core::snapshot::tests for the
+    // full install/reject/resp coverage). This test's remaining job is
+    // narrower: a malformed/stale install (here, `last_index: 0`, which is
+    // <= this fresh follower's snapshot base of 0) must be handled as a
+    // no-op ack rather than panicking or installing anything.
     #[test]
-    fn install_snapshot_is_ignored_not_panicked() {
+    fn install_snapshot_with_last_index_zero_is_a_stale_no_op_not_panicked() {
         let mut c = RaftCore::new(cfg(1, &[1, 2, 3]), MemStorage::default()).unwrap();
         let msg = Message::InstallSnapshot(crate::rpc::InstallSnapshotReq {
             term: 1,
@@ -422,7 +457,12 @@ mod tests {
             last_index: 0,
             last_term: 0,
             data: vec![],
+            config: vec![],
         });
         assert!(c.step(2, msg).is_ok());
+        // last_index 0 <= this follower's snapshot base (0): stale, so
+        // nothing was installed.
+        assert_eq!(c.storage.snapshot_meta(), SnapshotMeta::default());
+        assert_eq!(c.commit_index(), 0);
     }
 }

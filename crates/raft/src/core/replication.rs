@@ -1,5 +1,7 @@
+use super::membership::decode_voters;
 use super::*;
 use crate::rpc::{AppendEntriesReq, AppendEntriesResp};
+use crate::types::EntryType;
 
 impl<S: RaftStorage> RaftCore<S> {
     /// Appends `command` to the log at `current_term`/`last_index() + 1`
@@ -11,11 +13,7 @@ impl<S: RaftStorage> RaftCore<S> {
             return Ok(None);
         }
         let index = self.storage.last_index() + 1;
-        let entry = LogEntry {
-            term: self.current_term(),
-            index,
-            command,
-        };
+        let entry = LogEntry::normal(self.current_term(), index, command);
         self.storage.append(std::slice::from_ref(&entry))?;
 
         let self_id = self.config.id;
@@ -37,8 +35,7 @@ impl<S: RaftStorage> RaftCore<S> {
     pub(super) fn broadcast_append(&mut self) -> Result<()> {
         let self_id = self.config.id;
         let peers: Vec<NodeId> = self
-            .config
-            .peers
+            .voters
             .iter()
             .copied()
             .filter(|&p| p != self_id)
@@ -56,8 +53,18 @@ impl<S: RaftStorage> RaftCore<S> {
     /// safe lower bound without re-deriving the request's extent — see the
     /// `inflight` field doc for why FIFO pop-front is safe under
     /// overlapping in-flight requests.
-    fn send_append_to(&mut self, peer: NodeId) -> Result<()> {
+    ///
+    /// `pub(super)` because `handle_install_snapshot_resp`
+    /// (core/snapshot.rs) calls this to resume ordinary replication once a
+    /// follower has caught up via InstallSnapshot.
+    pub(super) fn send_append_to(&mut self, peer: NodeId) -> Result<()> {
         let ni = self.next_index.get(&peer).copied().unwrap_or(1);
+        // The entries peer needs (from next_index onward) were already
+        // compacted away by a snapshot — there's nothing in the log to send
+        // it anymore, so send the snapshot instead.
+        if ni <= self.storage.snapshot_meta().last_index {
+            return self.send_install_snapshot(peer);
+        }
         let prev = ni.saturating_sub(1);
         let prev_term = self.term_at(prev)?;
         let entries = self.storage.entries_from(ni);
@@ -189,13 +196,20 @@ impl<S: RaftStorage> RaftCore<S> {
                 .cloned()
                 .collect();
             self.storage.append(&new_entries)?;
+            // Effect-on-append (a freshly appended ConfigChange must take
+            // effect immediately, even on a follower) AND revert-on-
+            // truncation (the conflict branch above may have just dropped a
+            // config entry that used to be the latest) both land here,
+            // since this is the one place after either kind of log
+            // mutation in this handler.
+            self.recompute_voters()?;
         }
 
         let new_commit = req.leader_commit.min(self.storage.last_index());
         if new_commit > self.commit_index {
             self.commit_index = new_commit;
         }
-        self.advance_apply();
+        self.advance_apply()?;
 
         self.outbox.push((
             from,
@@ -304,8 +318,7 @@ impl<S: RaftStorage> RaftCore<S> {
         let mut n = last_index;
         while n > self.commit_index {
             let acked = self
-                .config
-                .peers
+                .voters
                 .iter()
                 .filter(|&&peer| self.match_index.get(&peer).copied().unwrap_or(0) >= n)
                 .count();
@@ -316,8 +329,7 @@ impl<S: RaftStorage> RaftCore<S> {
             n -= 1;
         }
 
-        self.advance_apply();
-        Ok(())
+        self.advance_apply()
     }
 
     /// Moves `last_applied` up to `commit_index` (all roles — leader after
@@ -330,14 +342,30 @@ impl<S: RaftStorage> RaftCore<S> {
     /// current term flips `readable_term`, which is what lets a leader
     /// start serving linearizable reads (Task 6) — it now knows it has
     /// applied at least one entry from its own term, per §8.
-    fn advance_apply(&mut self) {
+    ///
+    /// Also detects a `ConfigChange` COMMITTING (not merely appended) that
+    /// excludes this node: the moment `commit_index` crosses such an entry,
+    /// this node steps down (`become_follower`) and stops campaigning. This
+    /// runs here rather than at append time — `handle_append_entries`'s
+    /// append path and `propose_conf_change` already made the new config
+    /// live via `recompute_voters` — because stepping down early (on
+    /// append, before the change is durable on a majority) could strand
+    /// the entry uncommitted forever: a leader that stepped down the
+    /// instant it appended its own removal would never finish replicating
+    /// or committing it.
+    fn advance_apply(&mut self) -> Result<()> {
         if self.last_applied >= self.commit_index {
-            return;
+            return Ok(());
         }
         let snapshot_last = self.storage.snapshot_meta().last_index;
         let current_term = self.current_term();
         let target = self.commit_index;
         let mut pending = self.storage.entries_from(self.last_applied + 1).into_iter();
+        // Tracks whether the latest ConfigChange entry applied in THIS call
+        // excludes self — overwritten on each ConfigChange encountered, so
+        // a later entry re-including self correctly cancels an earlier
+        // exclusion within the same batch.
+        let mut excludes_self_on_commit = false;
 
         while self.last_applied < target {
             self.last_applied += 1;
@@ -348,9 +376,23 @@ impl<S: RaftStorage> RaftCore<S> {
                 if entry.term == current_term {
                     self.readable_term = Some(current_term);
                 }
+                if entry.entry_type == EntryType::ConfigChange {
+                    let committed_voters = decode_voters(&entry.command)?;
+                    excludes_self_on_commit = !committed_voters.contains(&self.config.id);
+                }
                 self.apply_buf.push(entry);
             }
         }
+
+        // Only a Leader stepping down on its own committed removal makes
+        // sense here — a plain Follower being removed has no leadership to
+        // relinquish, and calling `become_follower` on it would needlessly
+        // clear `leader_id` mid-apply, severing its (still valid) knowledge
+        // of who to forward writes to.
+        if excludes_self_on_commit && self.role == Role::Leader {
+            self.become_follower(current_term, None)?;
+        }
+        Ok(())
     }
 }
 
@@ -436,11 +478,7 @@ mod tests {
                 leader_id: 1,
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![LogEntry {
-                    term: 1,
-                    index: 1,
-                    command: b"a".to_vec(),
-                }],
+                entries: vec![LogEntry::normal(1, 1, b"a".to_vec())],
                 leader_commit: 0,
             }),
         )
@@ -477,21 +515,9 @@ mod tests {
     fn follower_rejects_on_prev_term_mismatch_with_conflict_index() {
         let mut s = MemStorage::default();
         s.append(&[
-            LogEntry {
-                term: 1,
-                index: 1,
-                command: vec![],
-            },
-            LogEntry {
-                term: 1,
-                index: 2,
-                command: vec![],
-            },
-            LogEntry {
-                term: 2,
-                index: 3,
-                command: vec![],
-            },
+            LogEntry::normal(1, 1, vec![]),
+            LogEntry::normal(1, 2, vec![]),
+            LogEntry::normal(2, 3, vec![]),
         ])
         .unwrap();
         let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), s).unwrap();
@@ -527,16 +553,8 @@ mod tests {
     fn follower_truncates_conflicting_suffix() {
         let mut s = MemStorage::default();
         s.append(&[
-            LogEntry {
-                term: 1,
-                index: 1,
-                command: vec![],
-            },
-            LogEntry {
-                term: 1,
-                index: 2,
-                command: vec![9],
-            },
+            LogEntry::normal(1, 1, vec![]),
+            LogEntry::normal(1, 2, vec![9]),
         ])
         .unwrap();
         let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), s).unwrap();
@@ -548,11 +566,7 @@ mod tests {
                 leader_id: 1,
                 prev_log_index: 1,
                 prev_log_term: 1,
-                entries: vec![LogEntry {
-                    term: 2,
-                    index: 2,
-                    command: vec![7],
-                }],
+                entries: vec![LogEntry::normal(2, 2, vec![7])],
                 leader_commit: 0,
             }),
         )
@@ -607,11 +621,7 @@ mod tests {
         let mut s = MemStorage::default();
         s.append(
             &(1..=10)
-                .map(|i| LogEntry {
-                    term: 1,
-                    index: i,
-                    command: vec![],
-                })
+                .map(|i| LogEntry::normal(1, i, vec![]))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -625,11 +635,7 @@ mod tests {
         let _ = c.ready();
 
         c.storage
-            .append(&[LogEntry {
-                term: 1,
-                index: 11,
-                command: vec![],
-            }])
+            .append(&[LogEntry::normal(1, 11, vec![])])
             .unwrap();
         c.send_append_to(2).unwrap(); // up_to = 11, next_index[2] still 5
         let _ = c.ready();
@@ -727,16 +733,8 @@ mod tests {
     fn leader_term2_prior_and_current_entries() -> RaftCore<MemStorage> {
         let mut s = MemStorage::default();
         s.append(&[
-            LogEntry {
-                term: 1,
-                index: 1,
-                command: vec![],
-            },
-            LogEntry {
-                term: 2,
-                index: 2,
-                command: vec![],
-            },
+            LogEntry::normal(1, 1, vec![]),
+            LogEntry::normal(2, 2, vec![]),
         ])
         .unwrap();
         s.save_hard_state(&HardState {
@@ -819,16 +817,8 @@ mod tests {
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![
-                    LogEntry {
-                        term: 1,
-                        index: 1,
-                        command: b"a".to_vec(),
-                    },
-                    LogEntry {
-                        term: 1,
-                        index: 2,
-                        command: b"b".to_vec(),
-                    },
+                    LogEntry::normal(1, 1, b"a".to_vec()),
+                    LogEntry::normal(1, 2, b"b".to_vec()),
                 ],
                 leader_commit: 5, // beyond this follower's last_index (2)
             }),

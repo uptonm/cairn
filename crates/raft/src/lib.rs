@@ -9,7 +9,7 @@ pub mod storage;
 pub mod transport;
 pub mod types;
 
-pub use core::{Config, RaftCore, ReadToken, Ready, Role};
+pub use core::{ConfChange, Config, RaftCore, ReadToken, Ready, Role};
 pub use error::{Error, Result};
 pub use log::RaftLog;
 pub use rpc::{
@@ -18,4 +18,4 @@ pub use rpc::{
 };
 pub use storage::{MemStorage, RaftStorage};
 pub use transport::tcp::TcpTransport;
-pub use types::{HardState, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
+pub use types::{EntryType, HardState, LogEntry, LogIndex, NodeId, SnapshotMeta, Term};
