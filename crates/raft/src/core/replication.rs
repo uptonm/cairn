@@ -56,8 +56,18 @@ impl<S: RaftStorage> RaftCore<S> {
     /// safe lower bound without re-deriving the request's extent — see the
     /// `inflight` field doc for why FIFO pop-front is safe under
     /// overlapping in-flight requests.
-    fn send_append_to(&mut self, peer: NodeId) -> Result<()> {
+    ///
+    /// `pub(super)` because `handle_install_snapshot_resp`
+    /// (core/snapshot.rs) calls this to resume ordinary replication once a
+    /// follower has caught up via InstallSnapshot.
+    pub(super) fn send_append_to(&mut self, peer: NodeId) -> Result<()> {
         let ni = self.next_index.get(&peer).copied().unwrap_or(1);
+        // The entries peer needs (from next_index onward) were already
+        // compacted away by a snapshot — there's nothing in the log to send
+        // it anymore, so send the snapshot instead.
+        if ni <= self.storage.snapshot_meta().last_index {
+            return self.send_install_snapshot(peer);
+        }
         let prev = ni.saturating_sub(1);
         let prev_term = self.term_at(prev)?;
         let entries = self.storage.entries_from(ni);

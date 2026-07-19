@@ -129,8 +129,8 @@ pub struct RaftCore<S: RaftStorage> {
     reads_buf: Vec<ReadToken>,
     /// Set when a snapshot arrives that the caller must install into its
     /// state machine before further applies proceed; drained by `ready()`
-    /// into `Ready.restore`. Nothing populates this yet — that lands in
-    /// Task 3 (InstallSnapshot RPC handling).
+    /// into `Ready.restore`. Populated by `handle_install_snapshot`
+    /// (core/snapshot.rs) on a fresh (non-stale) InstallSnapshot.
     restore_buf: Option<(SnapshotMeta, Vec<u8>)>,
 }
 
@@ -224,12 +224,14 @@ impl<S: RaftStorage> RaftCore<S> {
         self.storage
     }
 
-    /// Dispatch skeleton. `InstallSnapshot`/`InstallSnapshotResp` are
-    /// permanently ignored here (snapshot install is out of RaftCore's
-    /// scope).
+    /// Dispatch. `InstallSnapshot`/`InstallSnapshotResp` are routed to
+    /// core/snapshot.rs's handlers, which install/acknowledge a snapshot on
+    /// the follower side and advance replication progress on the leader
+    /// side.
     pub fn step(&mut self, from: NodeId, msg: Message) -> Result<()> {
         match msg {
-            Message::InstallSnapshot(_) | Message::InstallSnapshotResp(_) => Ok(()),
+            Message::InstallSnapshot(req) => self.handle_install_snapshot(from, req),
+            Message::InstallSnapshotResp(resp) => self.handle_install_snapshot_resp(from, resp),
             Message::RequestVote(req) => self.handle_request_vote(from, req),
             Message::RequestVoteResp(resp) => self.handle_vote_resp(from, resp),
             Message::AppendEntries(req) => self.handle_append_entries(from, req),
@@ -422,8 +424,13 @@ mod tests {
         assert_eq!(restarted.last_applied, 0);
     }
 
+    // A valid InstallSnapshot now ACTS (see core::snapshot::tests for the
+    // full install/reject/resp coverage). This test's remaining job is
+    // narrower: a malformed/stale install (here, `last_index: 0`, which is
+    // <= this fresh follower's snapshot base of 0) must be handled as a
+    // no-op ack rather than panicking or installing anything.
     #[test]
-    fn install_snapshot_is_ignored_not_panicked() {
+    fn install_snapshot_with_last_index_zero_is_a_stale_no_op_not_panicked() {
         let mut c = RaftCore::new(cfg(1, &[1, 2, 3]), MemStorage::default()).unwrap();
         let msg = Message::InstallSnapshot(crate::rpc::InstallSnapshotReq {
             term: 1,
@@ -433,5 +440,9 @@ mod tests {
             data: vec![],
         });
         assert!(c.step(2, msg).is_ok());
+        // last_index 0 <= this follower's snapshot base (0): stale, so
+        // nothing was installed.
+        assert_eq!(c.storage.snapshot_meta(), SnapshotMeta::default());
+        assert_eq!(c.commit_index(), 0);
     }
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::error::Error;
+use crate::rpc::{InstallSnapshotReq, InstallSnapshotResp};
 
 impl<S: RaftStorage> RaftCore<S> {
     /// Snapshots the state machine as of `index`, persisting `data` as the
@@ -32,14 +33,129 @@ impl<S: RaftStorage> RaftCore<S> {
         };
         self.storage.save_snapshot(meta, &data)
     }
+
+    /// Sends `peer` the whole current snapshot in one message (chunking
+    /// deferred). Called from `send_append_to` (core/replication.rs) once it
+    /// determines `peer`'s `next_index` has fallen at or below the snapshot
+    /// base, meaning the entries it needs were already compacted away.
+    ///
+    /// Guards against sending when there's no real snapshot yet (base ==
+    /// 0): this also sidesteps the zero-byte-payload/`read_snapshot ==
+    /// None` ambiguity a caller could otherwise hit — `read_snapshot`
+    /// returning `None` is only ever expected in that no-snapshot case, so
+    /// this guard means the `ok_or_else` below firing is always a genuine
+    /// storage inconsistency (metadata present, bytes missing), never the
+    /// ordinary "nothing to send" case.
+    ///
+    /// Deliberately does NOT push onto `inflight`/`send_count`: those stay
+    /// keyed on AppendEntries only — a peer being snapshotted is by
+    /// definition not confirming reads, so it has nothing to contribute to
+    /// that accounting.
+    pub(super) fn send_install_snapshot(&mut self, peer: NodeId) -> Result<()> {
+        if self.storage.snapshot_meta().last_index == 0 {
+            return Ok(());
+        }
+        let (meta, data) = self.storage.read_snapshot()?.ok_or_else(|| {
+            Error::Corruption("snapshot metadata present but bytes missing".into())
+        })?;
+        let req = InstallSnapshotReq {
+            term: self.current_term(),
+            leader_id: self.config.id,
+            last_index: meta.last_index,
+            last_term: meta.last_term,
+            data,
+        };
+        self.outbox.push((peer, Message::InstallSnapshot(req)));
+        Ok(())
+    }
+
+    /// Follower-side InstallSnapshot handler. A stale sender (behind our
+    /// term) is rejected outright. Otherwise the sender is adopted as
+    /// leader (`become_follower` persists on term bump, steps down, resets
+    /// the election timer, and sets `leader_id` unconditionally — so that
+    /// happens even on a same-term contact from an already-known leader).
+    ///
+    /// A snapshot at or behind what we already hold (by snapshot base OR by
+    /// `commit_index`) is stale/redundant: it must be acknowledged but never
+    /// installed, since installing it would regress state this node has
+    /// already moved past — a safety violation the instant that regressed
+    /// `commit_index`/`last_applied` gets re-applied against a state
+    /// machine that's already ahead of it.
+    pub(super) fn handle_install_snapshot(
+        &mut self,
+        from: NodeId,
+        req: InstallSnapshotReq,
+    ) -> Result<()> {
+        let current_term = self.current_term();
+        if req.term < current_term {
+            self.outbox.push((
+                from,
+                Message::InstallSnapshotResp(InstallSnapshotResp { term: current_term }),
+            ));
+            return Ok(());
+        }
+
+        self.become_follower(req.term, Some(req.leader_id))?;
+        let current_term = self.current_term();
+
+        if req.last_index <= self.storage.snapshot_meta().last_index
+            || req.last_index <= self.commit_index
+        {
+            self.outbox.push((
+                from,
+                Message::InstallSnapshotResp(InstallSnapshotResp { term: current_term }),
+            ));
+            return Ok(());
+        }
+
+        let meta = SnapshotMeta {
+            last_index: req.last_index,
+            last_term: req.last_term,
+        };
+        self.storage.save_snapshot(meta, &req.data)?;
+        self.commit_index = req.last_index;
+        self.last_applied = req.last_index;
+        // The driver must reload its state machine from these bytes before
+        // any further applies proceed — drained into Ready.restore.
+        self.restore_buf = Some((meta, req.data));
+
+        self.outbox.push((
+            from,
+            Message::InstallSnapshotResp(InstallSnapshotResp { term: current_term }),
+        ));
+        Ok(())
+    }
+
+    /// Leader-side InstallSnapshotResp handler. A higher-term reply means
+    /// this leader is stale and must step down. Otherwise, on success, the
+    /// follower's progress is set to the snapshot base we just sent it, and
+    /// replication resumes from there with ordinary AppendEntries for
+    /// whatever post-snapshot entries exist.
+    pub(super) fn handle_install_snapshot_resp(
+        &mut self,
+        from: NodeId,
+        resp: InstallSnapshotResp,
+    ) -> Result<()> {
+        if resp.term > self.current_term() {
+            return self.become_follower(resp.term, None);
+        }
+        if self.role != Role::Leader {
+            return Ok(());
+        }
+        let base = self.storage.snapshot_meta().last_index;
+        let match_idx = self.match_index.get(&from).copied().unwrap_or(0).max(base);
+        self.match_index.insert(from, match_idx);
+        self.next_index.insert(from, base + 1);
+        self.send_append_to(from)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{AppendEntriesResp, RequestVoteResp};
+    use crate::rpc::{AppendEntriesResp, InstallSnapshotReq, RequestVoteResp};
     use crate::storage::MemStorage;
-    use crate::types::LogEntry;
+    use crate::types::{HardState, LogEntry};
 
     fn cfg(id: NodeId, peers: &[NodeId]) -> Config {
         Config {
@@ -160,6 +276,197 @@ mod tests {
         assert_eq!(c.last_applied, 3);
         c.compact(3, b"state".to_vec()).unwrap();
         assert_eq!(c.storage.snapshot_meta().last_index, 3);
+    }
+
+    // --- Task 3: InstallSnapshot send + receive + resp ---
+
+    #[test]
+    fn leader_sends_install_snapshot_to_peer_behind_snapshot_base() {
+        let mut c = leader_with_committed_entries();
+        // Peer 2 acked through index 3 (next_index[2] == 4); peer 3 never
+        // acked anything (next_index[3] == 1, its become_leader default).
+        c.compact(2, b"state".to_vec()).unwrap();
+
+        c.broadcast_append().unwrap();
+        let r = c.ready();
+
+        // Peer 3's next_index (1) is at/below the new snapshot base (2): it
+        // must get InstallSnapshot, not AppendEntries.
+        let to_3 = r
+            .messages
+            .iter()
+            .find(|(to, _)| *to == 3)
+            .map(|(_, m)| m.clone())
+            .expect("peer 3 must receive something");
+        match to_3 {
+            Message::InstallSnapshot(req) => {
+                assert_eq!(req.last_index, 2);
+                assert_eq!(req.last_term, 1);
+                assert_eq!(req.data, b"state".to_vec());
+            }
+            other => panic!("expected InstallSnapshot to peer 3, got {other:?}"),
+        }
+
+        // Peer 2's next_index (4) is beyond the snapshot base: still a
+        // normal AppendEntries.
+        let to_2 = r
+            .messages
+            .iter()
+            .find(|(to, _)| *to == 2)
+            .map(|(_, m)| m.clone())
+            .expect("peer 2 must receive something");
+        assert!(matches!(to_2, Message::AppendEntries(_)));
+    }
+
+    #[test]
+    fn follower_installs_fresh_snapshot_and_advances_state() {
+        let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), MemStorage::default()).unwrap();
+        c.step(
+            1,
+            Message::InstallSnapshot(InstallSnapshotReq {
+                term: 1,
+                leader_id: 1,
+                last_index: 5,
+                last_term: 1,
+                data: b"state".to_vec(),
+            }),
+        )
+        .unwrap();
+        let r = c.ready();
+
+        assert_eq!(
+            c.storage.snapshot_meta(),
+            SnapshotMeta {
+                last_index: 5,
+                last_term: 1
+            }
+        );
+        assert_eq!(c.commit_index(), 5);
+        assert_eq!(c.last_applied, 5);
+        assert_eq!(
+            r.restore,
+            Some((
+                SnapshotMeta {
+                    last_index: 5,
+                    last_term: 1
+                },
+                b"state".to_vec()
+            ))
+        );
+        assert!(r
+            .messages
+            .iter()
+            .any(|(_, m)| matches!(m, Message::InstallSnapshotResp(resp) if resp.term == 1)));
+        assert_eq!(c.leader_id(), Some(1));
+    }
+
+    #[test]
+    fn stale_install_snapshot_is_a_no_op_ack_and_does_not_regress_state() {
+        let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), MemStorage::default()).unwrap();
+        c.step(
+            1,
+            Message::InstallSnapshot(InstallSnapshotReq {
+                term: 1,
+                leader_id: 1,
+                last_index: 5,
+                last_term: 1,
+                data: b"state".to_vec(),
+            }),
+        )
+        .unwrap();
+        let _ = c.ready();
+        assert_eq!(c.commit_index(), 5);
+
+        // A second install at or below what's already installed must not
+        // regress commit_index/last_applied/snapshot, even with different
+        // (bogus) bytes.
+        c.step(
+            1,
+            Message::InstallSnapshot(InstallSnapshotReq {
+                term: 1,
+                leader_id: 1,
+                last_index: 3,
+                last_term: 1,
+                data: b"stale-bogus".to_vec(),
+            }),
+        )
+        .unwrap();
+        let r2 = c.ready();
+
+        assert_eq!(c.storage.snapshot_meta().last_index, 5);
+        assert_eq!(c.commit_index(), 5);
+        assert_eq!(c.last_applied, 5);
+        assert!(r2.restore.is_none());
+        assert!(r2
+            .messages
+            .iter()
+            .any(|(_, m)| matches!(m, Message::InstallSnapshotResp(_))));
+    }
+
+    #[test]
+    fn follower_rejects_install_snapshot_from_stale_term() {
+        let mut s = MemStorage::default();
+        s.save_hard_state(&HardState {
+            current_term: 5,
+            voted_for: None,
+        })
+        .unwrap();
+        let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), s).unwrap();
+        c.step(
+            1,
+            Message::InstallSnapshot(InstallSnapshotReq {
+                term: 3,
+                leader_id: 1,
+                last_index: 9,
+                last_term: 3,
+                data: b"nope".to_vec(),
+            }),
+        )
+        .unwrap();
+        let r = c.ready();
+        assert!(r.messages.iter().any(|(_, m)| matches!(
+            m, Message::InstallSnapshotResp(resp) if resp.term == 5
+        )));
+        assert_eq!(c.storage.snapshot_meta().last_index, 0);
+        assert_eq!(c.commit_index(), 0);
+        assert_eq!(c.leader_id(), None); // a stale sender must not be adopted
+    }
+
+    #[test]
+    fn install_snapshot_resp_advances_progress_and_resumes_append_entries() {
+        let mut c = leader_with_committed_entries();
+        c.compact(2, b"state".to_vec()).unwrap();
+        c.broadcast_append().unwrap(); // sends InstallSnapshot to peer 3
+        let _ = c.ready();
+        let term = c.current_term();
+
+        c.step(
+            3,
+            Message::InstallSnapshotResp(crate::rpc::InstallSnapshotResp { term }),
+        )
+        .unwrap();
+
+        // match_index[3] takes the snapshot base (2); next_index[3] == 3,
+        // so the AppendEntries that follows carries prev_log_index == 2.
+        assert_eq!(c.match_index_of(3), 2);
+        let r = c.ready();
+        assert!(r.messages.iter().any(|(to, m)| *to == 3
+            && matches!(m, Message::AppendEntries(req) if req.prev_log_index == 2)));
+    }
+
+    #[test]
+    fn install_snapshot_resp_with_higher_term_steps_leader_down() {
+        let mut c = leader_with_committed_entries();
+        let higher = c.current_term() + 5;
+
+        c.step(
+            3,
+            Message::InstallSnapshotResp(crate::rpc::InstallSnapshotResp { term: higher }),
+        )
+        .unwrap();
+
+        assert_eq!(c.role(), Role::Follower);
+        assert_eq!(c.current_term(), higher);
     }
 
     #[test]
