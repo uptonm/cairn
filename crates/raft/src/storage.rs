@@ -39,10 +39,10 @@ pub struct MemStorage {
     hs: HardState,
     entries: Vec<LogEntry>,
     snapshot: SnapshotMeta,
-    /// Non-empty only once `save_snapshot` has been called; empty data is
-    /// treated as "no snapshot yet" since a real snapshot's payload is never
-    /// empty in practice, so `snapshot_data.is_empty()` doubles as the
-    /// has-snapshot predicate without a separate bool flag.
+    /// The snapshot's state-machine bytes. May legitimately be empty (an
+    /// empty state machine still snapshots), so it is NOT the has-snapshot
+    /// predicate — `snapshot.last_index == 0` is (a real snapshot always has
+    /// `last_index >= 1`; `SnapshotMeta::default()` means "none yet").
     snapshot_data: Vec<u8>,
     /// The encoded voter set as of `snapshot`, persisted alongside the
     /// snapshot's state-machine bytes so membership survives compaction and
@@ -144,7 +144,7 @@ impl RaftStorage for MemStorage {
     }
 
     fn read_snapshot(&self) -> Result<Option<StoredSnapshot>> {
-        if self.snapshot_data.is_empty() {
+        if self.snapshot.last_index == 0 {
             return Ok(None);
         }
         Ok(Some((
@@ -276,6 +276,42 @@ mod tests {
         assert_eq!(s.last_index(), 5); // no entries; base is the snapshot
         assert_eq!(s.entries_from(1), vec![]);
         assert_eq!(s.term(5).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn no_snapshot_reads_back_as_none() {
+        let s = MemStorage::default();
+        assert_eq!(s.read_snapshot().unwrap(), None);
+    }
+
+    #[test]
+    fn empty_payload_snapshot_is_still_a_snapshot() {
+        // The has-snapshot predicate must key off the metadata, not the
+        // state-machine payload: a legitimate snapshot can have empty `data`
+        // (an empty state machine) while still carrying a real config that
+        // must survive. Keying off `data.is_empty()` would read this back as
+        // `None` and silently discard the config.
+        let mut s = MemStorage::default();
+        s.save_snapshot(
+            SnapshotMeta {
+                last_index: 3,
+                last_term: 2,
+            },
+            b"",
+            b"cfg",
+        )
+        .unwrap();
+        assert_eq!(
+            s.read_snapshot().unwrap(),
+            Some((
+                SnapshotMeta {
+                    last_index: 3,
+                    last_term: 2
+                },
+                Vec::new(),
+                b"cfg".to_vec()
+            ))
+        );
     }
 
     #[test]

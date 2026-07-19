@@ -75,10 +75,12 @@ impl<S: RaftStorage> RaftCore<S> {
     ///    currently present in the live log tail (whether committed or not
     ///    — effect-on-append);
     /// 2. else the config persisted alongside the current snapshot, if one
-    ///    exists and recorded a non-empty config (see `RaftStorage::save_snapshot`
-    ///    / `compact`) — this is what lets a config that's been compacted
-    ///    out of the log (its `ConfigChange` entry gone) still be recovered
-    ///    correctly, rather than silently reverting to bootstrap;
+    ///    exists (see `RaftStorage::save_snapshot` / `compact`) — this is
+    ///    what lets a config that's been compacted out of the log (its
+    ///    `ConfigChange` entry gone) still be recovered correctly, rather
+    ///    than silently reverting to bootstrap. A present snapshot whose
+    ///    recorded config is empty or undecodable is a corrupt store, not a
+    ///    reason to adopt bootstrap peers — it's reported as `Corruption`;
     /// 3. else the bootstrap `config.peers`, for a node that has never seen
     ///    a config entry OR a snapshot at all.
     ///
@@ -101,8 +103,15 @@ impl<S: RaftStorage> RaftCore<S> {
         self.voters = match latest_config_change {
             Some(entry) => decode_voters(&entry.command)?,
             None => match self.storage.read_snapshot()? {
-                Some((_, _, config)) if !config.is_empty() => decode_voters(&config)?,
-                _ => self.config.peers.iter().copied().collect(),
+                Some((_, _, config)) => {
+                    if config.is_empty() {
+                        return Err(Error::Corruption(
+                            "snapshot present but its recorded config is empty".into(),
+                        ));
+                    }
+                    decode_voters(&config)?
+                }
+                None => self.config.peers.iter().copied().collect(),
             },
         };
         Ok(())
@@ -397,6 +406,40 @@ mod tests {
         // it with the ORIGINAL bootstrap config (peers [1,2,3]) — if the fix
         // works, the restarted node's membership must come from the
         // snapshot, not this bootstrap list.
+        let storage = c.into_storage();
+        let restarted = RaftCore::new(cfg(1, &[1, 2, 3]), storage).unwrap();
+
+        assert_eq!(restarted.voters(), vec![1, 2, 3, 4]);
+        assert_eq!(restarted.quorum(), 3); // majority of 4, not of the bootstrap 3
+    }
+
+    /// Same regression as `config_survives_compaction_and_restart`, but the
+    /// snapshot is taken with an EMPTY state-machine payload. A snapshot's
+    /// config must survive even when its `data` is empty: before the fix,
+    /// `MemStorage` used `data.is_empty()` as the has-snapshot predicate, so
+    /// an empty-payload snapshot read back as `None`, the recorded config was
+    /// discarded, and membership silently reverted to the bootstrap peers —
+    /// the wrong (smaller) quorum, a split-brain risk.
+    #[test]
+    fn config_survives_compaction_with_empty_snapshot_payload() {
+        let mut c = elect_leader_with_committed_noop(1, &[1, 2, 3]);
+        let term = c.current_term();
+
+        assert!(c
+            .propose_conf_change(ConfChange::AddVoter(4))
+            .unwrap()
+            .is_some());
+        let _ = c.ready();
+        c.step(2, success_resp(term)).unwrap();
+        c.step(3, success_resp(term)).unwrap();
+        assert_eq!(c.commit_index(), 2);
+        assert_eq!(c.last_applied, 2);
+        assert_eq!(c.voters(), vec![1, 2, 3, 4]);
+
+        // Compact past the ConfigChange entry with an EMPTY payload.
+        c.compact(2, vec![]).unwrap();
+        assert_eq!(c.storage.entries_from(1).len(), 0);
+
         let storage = c.into_storage();
         let restarted = RaftCore::new(cfg(1, &[1, 2, 3]), storage).unwrap();
 

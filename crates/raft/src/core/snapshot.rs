@@ -2,6 +2,7 @@ use super::membership::{decode_voters, encode_voters};
 use super::*;
 use crate::error::Error;
 use crate::rpc::{InstallSnapshotReq, InstallSnapshotResp};
+use crate::types::EntryType;
 
 impl<S: RaftStorage> RaftCore<S> {
     /// Snapshots the state machine as of `index`, persisting `data` as the
@@ -33,12 +34,39 @@ impl<S: RaftStorage> RaftCore<S> {
             last_term,
         };
         // The configuration is part of the snapshot's state, not just the
-        // state machine's: persisting the live voter set alongside `data`
-        // is what lets a restart or a follower installing this snapshot
-        // recover the correct membership even after the `ConfigChange`
-        // entry that produced it is compacted out of the log.
-        let config = encode_voters(&self.voters);
+        // state machine's: persisting it alongside `data` is what lets a
+        // restart or a follower installing this snapshot recover the correct
+        // membership even after the `ConfigChange` entry that produced it is
+        // compacted out of the log. It must be the config as-of `index`, NOT
+        // the live `self.voters` — effect-on-append means `self.voters` can
+        // reflect an uncommitted ConfigChange at an index beyond `index`.
+        let config = self.config_as_of(index)?;
         self.storage.save_snapshot(meta, &data, &config)
+    }
+
+    /// The encoded voter set in effect at `index`, using the same precedence
+    /// as `recompute_voters` but bounded to entries at or before `index`:
+    /// the latest ConfigChange in the live tail with `e.index <= index`;
+    /// else the current snapshot's config (carried forward); else the
+    /// bootstrap `config.peers`.
+    fn config_as_of(&self, index: LogIndex) -> Result<Vec<u8>> {
+        let current_base = self.storage.snapshot_meta().last_index;
+        let latest = self
+            .storage
+            .entries_from(current_base + 1)
+            .into_iter()
+            .filter(|e| e.index <= index)
+            .rfind(|e| e.entry_type == EntryType::ConfigChange);
+        match latest {
+            Some(entry) => Ok(entry.command),
+            None => match self.storage.read_snapshot()? {
+                Some((_, _, config)) => Ok(config),
+                None => {
+                    let peers: BTreeSet<NodeId> = self.config.peers.iter().copied().collect();
+                    Ok(encode_voters(&peers))
+                }
+            },
+        }
     }
 
     /// Sends `peer` the whole current snapshot in one message (chunking
@@ -133,6 +161,13 @@ impl<S: RaftStorage> RaftCore<S> {
         // is more current than the snapshot itself and must win.
         self.voters = decode_voters(&req.config)?;
         self.recompute_voters()?;
+        // Any entries already buffered for apply are for indices <= the old
+        // commit_index < req.last_index, so they're all strictly below the
+        // new base and superseded by the restore. Drop them, or one ready()
+        // would hand the driver restore + stale sub-base applies together
+        // and applying them after the restore would regress the state
+        // machine — violating the restore-before-apply contract.
+        self.apply_buf.clear();
         // The driver must reload its state machine from these bytes before
         // any further applies proceed — drained into Ready.restore.
         self.restore_buf = Some((meta, req.data));
@@ -160,6 +195,12 @@ impl<S: RaftStorage> RaftCore<S> {
         if self.role != Role::Leader {
             return Ok(());
         }
+        // A reply from an older term can't attest to anything about this
+        // leader's current term, so it must not touch progress — mirrors the
+        // same-term gate in `handle_append_resp`.
+        if resp.term < self.current_term() {
+            return Ok(());
+        }
         let base = self.storage.snapshot_meta().last_index;
         let match_idx = self.match_index.get(&from).copied().unwrap_or(0).max(base);
         self.match_index.insert(from, match_idx);
@@ -171,7 +212,7 @@ impl<S: RaftStorage> RaftCore<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{AppendEntriesResp, InstallSnapshotReq, RequestVoteResp};
+    use crate::rpc::{AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, RequestVoteResp};
     use crate::storage::MemStorage;
     use crate::types::{HardState, LogEntry};
 
@@ -429,6 +470,50 @@ mod tests {
             .any(|(_, m)| matches!(m, Message::InstallSnapshotResp(_))));
     }
 
+    /// Installing a snapshot supersedes every entry at or below its base.
+    /// Entries already buffered in `apply_buf` (indices <= the old
+    /// `commit_index` < `req.last_index`) are all strictly below the new
+    /// base, so they must be discarded — otherwise one `ready()` hands the
+    /// driver both `restore` (state @ base) and stale `apply` (<= base)
+    /// entries, and applying restore-then-stale-applies regresses the state
+    /// machine.
+    #[test]
+    fn install_snapshot_discards_stale_buffered_applies() {
+        let mut c = RaftCore::new(cfg(2, &[1, 2, 3]), MemStorage::default()).unwrap();
+        // Buffer an apply: append index 1 and commit it WITHOUT draining
+        // ready(), so the entry sits in apply_buf.
+        c.step(
+            1,
+            Message::AppendEntries(AppendEntriesReq {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry::normal(1, 1, b"x".to_vec())],
+                leader_commit: 1,
+            }),
+        )
+        .unwrap();
+
+        // A fresh snapshot installs strictly past that buffered apply.
+        c.step(
+            1,
+            Message::InstallSnapshot(InstallSnapshotReq {
+                term: 1,
+                leader_id: 1,
+                last_index: 5,
+                last_term: 1,
+                data: b"state".to_vec(),
+                config: voters_bytes(&[1, 2, 3]),
+            }),
+        )
+        .unwrap();
+
+        let r = c.ready();
+        assert!(r.apply.is_empty(), "stale sub-base applies must be dropped");
+        assert!(r.restore.is_some());
+    }
+
     #[test]
     fn follower_rejects_install_snapshot_from_stale_term() {
         let mut s = MemStorage::default();
@@ -479,6 +564,24 @@ mod tests {
         let r = c.ready();
         assert!(r.messages.iter().any(|(to, m)| *to == 3
             && matches!(m, Message::AppendEntries(req) if req.prev_log_index == 2)));
+    }
+
+    #[test]
+    fn install_snapshot_resp_from_stale_term_is_ignored() {
+        let mut c = leader_with_committed_entries();
+        let stale = c.current_term() - 1;
+
+        c.step(
+            3,
+            Message::InstallSnapshotResp(crate::rpc::InstallSnapshotResp { term: stale }),
+        )
+        .unwrap();
+
+        // A stale reply must neither resume replication to that peer nor
+        // step the leader down.
+        let r = c.ready();
+        assert!(!r.messages.iter().any(|(to, _)| *to == 3));
+        assert_eq!(c.role(), Role::Leader);
     }
 
     #[test]
@@ -578,6 +681,65 @@ mod tests {
         let _ = follower.ready();
 
         assert_eq!(follower.voters(), vec![1, 2, 3, 4, 5]);
+    }
+
+    /// `compact` must record the membership in effect AT the compacted
+    /// index, not the live `self.voters`. `self.voters` is effect-on-append:
+    /// it reflects the highest-index ConfigChange in the whole live tail,
+    /// which can be an UNCOMMITTED change beyond the compaction point. If the
+    /// snapshot stored that live set, a later leader lacking the uncommitted
+    /// change would truncate it away yet still recover the phantom voter from
+    /// the snapshot config.
+    #[test]
+    fn compact_stores_config_as_of_index_not_live_voters() {
+        use crate::core::membership::ConfChange;
+
+        let mut leader = elect_leader(1, &[1, 2, 3]);
+        let term = leader.current_term();
+        let ack = |t: Term| {
+            Message::AppendEntriesResp(AppendEntriesResp {
+                term: t,
+                success: true,
+                conflict_index: None,
+            })
+        };
+
+        // Commit the no-op@1.
+        leader.step(2, ack(term)).unwrap();
+        leader.step(3, ack(term)).unwrap();
+        let _ = leader.ready();
+        assert_eq!(leader.commit_index(), 1);
+
+        // Commit AddVoter(4)@2 -> live voters {1,2,3,4}.
+        assert!(leader
+            .propose_conf_change(ConfChange::AddVoter(4))
+            .unwrap()
+            .is_some());
+        let _ = leader.ready();
+        leader.step(2, ack(term)).unwrap();
+        leader.step(3, ack(term)).unwrap();
+        let _ = leader.ready();
+        assert_eq!(leader.commit_index(), 2);
+        assert_eq!(leader.last_applied, 2);
+
+        // Append AddVoter(5)@3 but LEAVE IT UNCOMMITTED. Effect-on-append
+        // moves the live set to {1,2,3,4,5} though index 3 never commits.
+        assert!(leader
+            .propose_conf_change(ConfChange::AddVoter(5))
+            .unwrap()
+            .is_some());
+        let _ = leader.ready();
+        assert_eq!(leader.voters(), vec![1, 2, 3, 4, 5]);
+
+        // Compact at index 2 (<= last_applied, < the uncommitted change@3).
+        // The stored config must be the membership in effect AT index 2 —
+        // {1,2,3,4} — not the live set an uncommitted later entry advanced.
+        leader.compact(2, b"state".to_vec()).unwrap();
+        let (_, _, config) = leader.storage.read_snapshot().unwrap().unwrap();
+        assert_eq!(
+            decode_voters(&config).unwrap(),
+            [1, 2, 3, 4].into_iter().collect::<BTreeSet<NodeId>>()
+        );
     }
 
     #[test]

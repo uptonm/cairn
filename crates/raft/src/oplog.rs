@@ -281,6 +281,26 @@ mod tests {
     }
 
     #[test]
+    fn replay_drops_record_torn_at_the_type_byte() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ops");
+        let mut w = OpWriter::create(&path).unwrap();
+        w.append(&Op::Append(entry(1, 1, b"a"))).unwrap();
+        drop(w);
+
+        // Lop off exactly the trailing entry_type byte: the tear now lands
+        // one byte before the record's end, inside the CRC'd body. The type
+        // byte is the last thing `read_body` reads for an Append, so its
+        // `remaining < 1` guard must catch this and stop replay cleanly.
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        let len = f.metadata().unwrap().len();
+        f.set_len(len - 1).unwrap();
+        drop(f);
+
+        assert_eq!(read_all(&path).unwrap(), vec![]);
+    }
+
+    #[test]
     fn oversized_command_length_stops_at_valid_prefix() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ops");
