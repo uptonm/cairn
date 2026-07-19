@@ -4,6 +4,7 @@
     "index",
     "architecture",
     "lsm-engine",
+    "consensus",
     "roadmap",
     "decisions",
     "benchmarks"

@@ -1,0 +1,63 @@
+---
+title: Read-Index
+description: Serving linearizable reads without a log write, and proving they're actually safe.
+---
+
+## The problem
+
+The simplest way to make a read linearizable in Raft is to route it through
+the log like any other command: propose a no-op, wait for it to commit,
+then read. That's correct, but it means every read pays for a log append
+and a disk fsync — expensive for a read-heavy workload. **Read-index** gets
+the same linearizability guarantee without writing anything to the log.
+
+## How it works
+
+`read_index(token)` registers a read request. The leader:
+
+1. **Snapshots its current `commit_index`** as the read's floor — nothing
+   committed after this point needs to be visible for the read to be valid.
+2. **Confirms it's still the leader** by forcing a heartbeat round and
+   waiting for a majority to acknowledge it — a stale or partitioned former
+   leader must not serve a read that a newer leader has already diverged
+   from.
+3. **Releases the read** — the token is emitted in `Ready.reads` — once
+   `last_applied` has caught up to the floor from step 1.
+
+The leadership-confirmation step doesn't use wall-clock "last heard from
+this peer at time T" bookkeeping, which is fragile under message reordering
+— an ack that arrives late could be mistaken for a fresh one. Instead each
+peer has a send/ack counter pair: the read snapshots the current send count
+per peer as a barrier, forces a broadcast, and only counts an ack toward
+the quorum once a peer's ack count has advanced *past* that snapshotted
+barrier — a pigeonhole argument that the ack corresponds to a message sent
+after the read was registered, not a stale one. That holds under arbitrary
+drop and reorder, which is exactly the condition the
+[transport](/docs/consensus/transport) and
+[simulation](/docs/consensus/safety-and-simulation) are built to exercise.
+
+## The freshly-elected-leader gap
+
+A newly elected leader's `commit_index` may still reflect entries from a
+*previous* term — it hasn't necessarily committed anything in its own term
+yet, since commit advancement only counts current-term entries (see
+[Election and Replication](/docs/consensus/election-and-replication#commit-advancement-the-current-term-rule)).
+Serving a read against that stale commit index would violate
+linearizability. `RaftCore` closes this the standard way: a freshly elected
+leader appends a no-op entry immediately, and won't release any read until
+that no-op has committed — which forces its commit index to be current
+before the first read can be trusted.
+
+## What the tests pin down
+
+Unit tests cover the release conditions directly: the floor is computed
+correctly, a read isn't released before quorum confirmation, a read isn't
+released before applied state catches up, and no read is served across the
+no-op gap on a freshly elected leader. The
+[deterministic simulation](/docs/consensus/safety-and-simulation) is what
+currently exercises this under realistic node behavior (elections,
+partitions, restarts); driving actual *reads* through the same
+arbitrary-reorder fault injection the simulation applies to writes is
+tracked as follow-on work for the chaos harness, not yet built — the
+simulation today asserts safety invariants over applied writes, not read
+outcomes.

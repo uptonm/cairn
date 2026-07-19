@@ -1,0 +1,73 @@
+---
+title: Overview
+description: The Phase 1 consensus layer — log store, transport, and RaftCore — and what's actually proven about it so far.
+---
+
+## Status: core shipped
+
+Raft consensus is `crates/raft` (`cairn-raft`), built bottom-up in three
+cycles, all merged: a dedicated **log store**, a pluggable **transport**
+layer, and **RaftCore** — a pure, synchronous, I/O-free consensus step
+function covering pre-vote leader election, log replication, commit
+advancement, and read-index linearizable reads. **104 library tests plus 9
+deterministic simulation tests, green.** The simulation drives a multi-node
+cluster through partition, drop, reorder, and crash-restart fault injection
+and checks four safety invariants after every scenario — see
+[Safety Invariants & Simulation](/docs/consensus/safety-and-simulation).
+
+What's left before this backs a live cluster: `InstallSnapshot` handling and
+joint-consensus membership changes, the async node driver that wires
+`RaftCore` to a real clock and the real transport, and the chaos/Jepsen
+harness. See [Roadmap](/docs/roadmap) for what's next and in what order.
+
+## What Raft turns the LSM engine into
+
+The [LSM storage engine](/docs/lsm-engine) is a durable, crash-recoverable
+*local* key-value store — it has no idea any other node exists. Raft
+replicates a log of commands across a fixed set of nodes so every replica
+applies the same commands in the same order, which is what turns that local
+store into a linearizable, fault-tolerant one. See
+[Raft over Paxos](/docs/decisions/raft-over-paxos) for why this project's
+consensus protocol is Raft specifically, and
+[Architecture](/docs/architecture#components) for where it sits in the
+overall stack.
+
+## Module map
+
+| Module | Responsibility |
+| --- | --- |
+| [Log store](/docs/consensus/log-store) | Durable, index-addressed storage for log entries, hard state, and snapshot metadata |
+| [Transport](/docs/consensus/transport) | The `Transport` trait, a deterministic in-memory implementation, and a framed TCP implementation |
+| [Election and replication](/docs/consensus/election-and-replication) | Pre-vote leader election and log replication as a pure step function |
+| [Read-index](/docs/consensus/read-index) | Linearizable reads without a log write |
+| [Safety invariants & simulation](/docs/consensus/safety-and-simulation) | The four properties RaftCore is checked against, and how the deterministic simulation proves them |
+
+## RaftCore's interface
+
+`RaftCore<S: RaftStorage>` is a synchronous struct — no async, no wall
+clock, no filesystem handle. It takes inputs and buffers outputs for a
+driver to send elsewhere:
+
+```rust
+fn tick(&mut self);                                    // advance logical time
+fn step(&mut self, from: NodeId, msg: Message) -> Result<()>; // process one inbound RPC
+fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex>;  // leader appends a command
+fn read_index(&mut self, token: ReadToken);             // register a linearizable read
+
+fn ready(&mut self) -> Ready; // drains { messages, apply, reads }
+```
+
+Keeping persistence behind a synchronous `RaftStorage` trait call (rather
+than an async one) lets the core itself enforce Raft's persist-before-act
+ordering — append then send, persist a vote then reply — and keeps
+simulation fully deterministic, since the storage backing it is
+synchronous too. Phase 1 ships `MemStorage`, an in-memory implementation
+for the core's own tests and simulation; a `RaftLog`-backed adapter that
+plugs the real [log store](/docs/consensus/log-store) into `RaftStorage` is
+part of the node-driver work still ahead.
+
+The state machine this cycle applies committed entries to is a simple
+in-memory KV — wiring the real LSM engine in as the applied state is also
+node-driver work, not part of `RaftCore` itself. Keeping that boundary
+narrow is what let the consensus core be built and proven correct without
+dragging the whole storage engine into every test.

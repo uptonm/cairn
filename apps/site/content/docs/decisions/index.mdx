@@ -10,6 +10,9 @@ in the repo, not reconstructed after the fact.
 
 - **[Raft over Paxos](/docs/decisions/raft-over-paxos)** — why consensus is
   Raft, not Paxos or a Paxos variant.
+- **[Pre-vote and read-index](/docs/decisions/pre-vote-and-read-index)** —
+  why elections use a non-disruptive pre-vote round and reads use
+  read-index, plus a real safety bug the design caught before merge.
 - **[LSM over B-tree](/docs/decisions/lsm-over-btree)** — why the storage
   engine is log-structured, and why the Raft log store is a separate
   component rather than another LSM consumer.

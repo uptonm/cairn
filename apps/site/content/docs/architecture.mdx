@@ -24,8 +24,8 @@ result is a complete, smaller system — never a broken half of a larger one.
 ┌──────────────────────────────────────────────────┐
 │  MVCC transaction layer  (Rust)                   │        Phase 3
 ├──────────────────────────────────────────────────┤
-│  Raft consensus  (Rust)                           │        Phase 2
-│  election · replication · read-index · snapshot · membership
+│  Raft consensus  (Rust)                           │        Phase 2 — core shipped
+│  election · replication · read-index ✓ · snapshot · membership ← next
 ├──────────────────────────────────────────────────┤
 │  Custom LSM storage engine  (Rust)                │        Phase 1 — shipped
 │  WAL · memtable · SSTables · leveled compaction · bloom
@@ -49,27 +49,34 @@ through every write so the future MVCC layer can store multiple versions per
 key. Depends on the filesystem only. Full internals: [LSM Storage
 Engine](/docs/lsm-engine).
 
-### 2. Raft consensus (Rust)
+### 2. Raft consensus (Rust) — core shipped
 
 Replicates a log of commands across a group so every replica applies the
 same commands in the same order, tolerating a minority of node failures.
-Leader election with pre-vote, log replication with a commit index,
-read-index for linearizable reads without a log write, log compaction via
-storage-engine snapshots, and joint-consensus membership changes. Depends on
-a dedicated Raft log store (append-oriented, index-keyed — not the LSM KV
-engine; see [Raft-over-Paxos](/docs/decisions/raft-over-paxos) and
+**Built:** leader election with pre-vote, log replication with the
+consistency check and conflict back-up, commit-index advancement under
+Raft's current-term rule, and read-index for linearizable reads without a
+log write — as `RaftCore`, a pure, synchronous, I/O-free step function,
+proven against four safety invariants by a deterministic multi-node
+simulation. **Next:** log compaction via storage-engine snapshots and
+joint-consensus membership changes. Depends on a dedicated Raft log store
+(append-oriented, index-keyed — not the LSM KV engine; see
+[Raft-over-Paxos](/docs/decisions/raft-over-paxos) and
 [log-store vs. LSM reuse](/docs/decisions/lsm-over-btree)) and a pluggable
 transport trait so a deterministic in-memory implementation can drive
-multi-node simulation in tests.
+multi-node simulation in tests. Full internals:
+[Raft Consensus](/docs/consensus).
 
-### 3. Transport / RPC (Rust)
+### 3. Transport / RPC (Rust) — shipped
 
 Node-to-node messaging for Raft (AppendEntries, RequestVote, snapshots) and
-client request routing. Async send/receive of typed messages, pluggable so
-the chaos harness can inject partitions, drops, delays, and reordering.
-Transport is kept deliberately dumb — length-prefixed messages over TCP —
-because the pluggable seam exists for the chaos harness, not for production
-networking features.
+client request routing, behind a `Transport` trait with two
+implementations: a deterministic, seeded in-memory transport for
+simulation (fault injection: partition, drop, delay) and a length-prefixed
+framed TCP transport for a real cluster. Transport is kept deliberately
+dumb by design — the pluggable seam exists for the chaos harness, not for
+production networking features. Wiring it into an async node event loop is
+still ahead. See [Transport](/docs/consensus/transport).
 
 ### 4. MVCC transaction layer (Rust)
 

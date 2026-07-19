@@ -1,0 +1,94 @@
+---
+title: Safety Invariants & Simulation
+description: The four properties RaftCore is checked against, and how a deterministic, seeded, fault-injecting simulation proves them instead of asserting them.
+---
+
+## Why this page exists
+
+Anyone can *implement* Raft. The hard part — and the actual differentiator
+for this project — is *proving* the implementation upholds Raft's safety
+guarantees under the exact conditions that break naive implementations:
+partitions, dropped and reordered messages, and crash-restarts mid-election
+or mid-replication. This page is about that proof, not the algorithm
+itself; see [Election and Replication](/docs/consensus/election-and-replication)
+and [Read-Index](/docs/consensus/read-index) for the mechanics.
+
+## The four invariants
+
+Every scripted scenario is checked against all four after it runs:
+
+- **Election safety** — at most one leader per term.
+- **Log matching** — if two logs contain an entry with the same index and
+  term, the logs are identical up through that index.
+- **State-machine safety** — no two nodes ever apply different commands at
+  the same log index.
+- **Leader completeness** *(containment)* — a committed entry is present in
+  the log of every future leader.
+
+These are exactly the properties [Raft over Paxos](/docs/decisions/raft-over-paxos)
+points to as the reason this project chose Raft in the first place: a
+protocol whose safety argument decomposes into a short, checkable invariant
+list is a protocol whose test suite can actually state those invariants as
+assertions and check them against a captured run, rather than trusting an
+aggregate correctness argument.
+
+## Determinism, on purpose
+
+A simulation that isn't reproducible is barely better than a flaky
+integration test. `RaftCore`'s simulation is built so that a fixed seed
+reproduces the exact same run, every time:
+
+- **Logical time only.** `tick()` drives every timeout; there is no
+  `Instant`/`SystemTime` anywhere in the core or the harness.
+- **Seeded randomness.** Election timeout jitter comes from a per-node PRNG
+  seeded at construction — same seed, same election timing.
+- **A single controlling task.** The harness advances every node's clock
+  and routes every message from one task with ordered collections, not a
+  `HashMap` whose iteration order can silently vary between runs.
+
+That combination means a failing scenario is always replayable from its
+seed — a real advantage over consensus bugs that only reproduce "sometimes,
+under load."
+
+## Fault injection
+
+Each scenario scripts a specific failure shape against the cluster:
+
+- **Clean election** — baseline: a leader is elected, invariants hold.
+- **Leader crash → re-election** — the current leader is killed mid-run; a
+  new one must be elected without violating election safety.
+- **Partition and heal** — a minority of nodes is cut off, rejoins later,
+  and must reconcile its log without diverging.
+- **Dropped `AppendEntries` → back-up and catch-up** — replication messages
+  are dropped; the `conflict_index` back-up mechanism must still converge
+  the follower's log.
+- **Reordered delivery** — messages arrive out of send order; the
+  consistency check must still reject genuine conflicts and accept genuine
+  progress.
+
+## What's actually running today
+
+**104 library tests plus 9 simulation tests, green**, covering unit-level
+behavior (vote-granting edge cases, term step-down, pre-vote
+non-disruption, consistency-check rejection and back-up, commit-index
+majority math including the current-term rule, read-index release
+conditions) and the scripted multi-node scenarios above. A dedicated
+**restart test** discards a node's volatile state, rebuilds `RaftCore` from
+its persisted storage, and checks that term, vote, and log all recover with
+no committed entry lost.
+
+Every change to `crates/raft` goes through a whole-branch adversarial
+review pass in addition to per-task review before merge — see
+[Pre-vote and Read-Index](/docs/decisions/pre-vote-and-read-index) for a
+real cross-cutting safety bug that pass caught and a per-task review had
+missed.
+
+## What this sets up
+
+The simulation today checks *write* safety across applied state. A
+standalone per-key linearizability checker (`lincheck`) already exists
+alongside `RaftCore`, built for the next stage: a chaos/Jepsen-style harness
+that drives a real cluster (real TCP transport, real crashes) through the
+same fault classes, records the resulting history of reads and writes, and
+checks that history against `lincheck` instead of hand-asserted invariants.
+See [Roadmap](/docs/roadmap) for where that sits in the sequencing.

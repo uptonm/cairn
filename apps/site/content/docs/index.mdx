@@ -31,6 +31,14 @@ Cross-shard transactions are explicitly out of the guarantee set for the
 first cut — see [Roadmap](/docs/roadmap) and the
 [design decisions](/docs/decisions) for how that's fenced.
 
+The storage engine and the Raft consensus core are both built and
+independently proven — the engine against a `BTreeMap` reference model, the
+consensus core against four safety invariants under a deterministic,
+fault-injecting simulation (see [Raft Consensus](/docs/consensus)). The
+guarantees above are what holds once they're wired into one running system
+and chaos-tested end to end, which is the work still ahead — see
+[Roadmap](/docs/roadmap) for exactly what's left.
+
 ## Non-goals
 
 - Serving third-party or production traffic. This runs locally or on a
@@ -46,6 +54,9 @@ first cut — see [Roadmap](/docs/roadmap) and the
   a write flows through it.
 - **[LSM Storage Engine](/docs/lsm-engine)** — internals of the Phase 1
   engine: WAL, memtable, SSTables, bloom filters, compaction.
+- **[Raft Consensus](/docs/consensus)** — the Phase 1 consensus core: log
+  store, transport, election and replication, read-index linearizable
+  reads, and the safety-invariant simulation that proves it.
 - **[Roadmap](/docs/roadmap)** — phased delivery plan with honest status.
 - **[Design Decisions](/docs/decisions)** — ADR-style writeups of the
   tradeoffs that shaped the system.
