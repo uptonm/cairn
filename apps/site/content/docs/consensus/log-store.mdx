@@ -1,0 +1,78 @@
+---
+title: Log Store
+description: Durable, index-addressed storage for the Raft log, hard state, and snapshot metadata — the foundation the consensus core is built on.
+---
+
+## Purpose
+
+Raft needs a durable, ordered log of entries indexed by a dense integer, not
+an arbitrary key — and it needs to be able to throw away a suffix of that
+log when a follower's history conflicts with a new leader's. That's a
+different access pattern from a KV store, which is why the log store is its
+own component in `crates/raft` rather than another consumer of the
+[LSM engine](/docs/lsm-engine). Full rationale:
+[LSM over B-tree](/docs/decisions/lsm-over-btree#why-the-raft-log-store-is-not-another-lsm-consumer).
+
+It was also the first thing built in the consensus cycle — everything else
+(transport, `RaftCore`) is testable against it without any networking or
+election logic in the picture.
+
+## What it durably tracks
+
+- **The log itself** — `LogEntry { term, index, command }`, appended in
+  order, addressed by index.
+- **Hard state** — `current_term` and `voted_for`, the two fields Raft
+  requires survive a crash before a node can safely take further action
+  (grant a vote, become a candidate). Persisted atomically and CRC'd.
+- **Snapshot metadata** — the index and term the latest snapshot covers, so
+  the log store knows what a compacted prefix stood for even after the
+  entries themselves are gone.
+
+## Interface
+
+```rust
+fn append(&mut self, entries: &[LogEntry]) -> Result<()>;
+fn entries_from(&self, index: LogIndex) -> Vec<LogEntry>;
+fn entry(&self, index: LogIndex) -> Result<Option<LogEntry>>;
+fn last_index(&self) -> LogIndex;
+fn last_term(&self) -> Term;
+fn truncate_suffix(&mut self, from_index: LogIndex) -> Result<()>; // conflict resolution
+fn compact_prefix(&mut self, up_to_index: LogIndex, meta: SnapshotMeta) -> Result<()>;
+fn save_hard_state(&mut self, hs: &HardState) -> Result<()>;
+fn load_hard_state(&self) -> HardState;
+```
+
+`truncate_suffix` and `compact_prefix` are the two operations that don't map
+cleanly onto an LSM engine's append-only, newest-wins model — a follower
+that discovers its log diverges from the leader's needs to drop everything
+after the conflict point outright, not shadow it with tombstones.
+
+## Durability: CRC records, torn-tail replay, truncate-on-open
+
+The log store reuses the ideas proven in the [WAL](/docs/lsm-engine/wal) —
+CRC-checksummed records and crash-tolerant replay — without inheriting its
+data structure. Each op-log record is length- and checksum-framed; on
+replay, the reader stops cleanly at the first corrupt or short record and
+returns everything valid read so far, the same torn-write discipline the
+storage engine's WAL uses.
+
+One thing the Raft log adds on top of that pattern: **truncate-on-open**. A
+crash can leave a torn tail behind even when nothing was actively being
+truncated — replay has to reconcile the on-disk op-log with the last known
+good state at open time, not just at the moment of a live write, since a
+`truncate_suffix` call itself has to be crash-safe.
+
+Hard state is persisted separately from the op-log, atomically and CRC'd,
+and fsync'd on every change — a node must never be able to lose or corrupt
+its current term or vote across a restart, since replaying a stale vote
+could let it grant two votes in the same term.
+
+## What's still a soft invariant
+
+`truncate_suffix`'s snapshot-boundary check — refusing to truncate at or
+below the last compacted index — is currently a `debug_assert` rather than
+a returned `Error::Corruption`, unlike `append` and `compact_prefix`, which
+were promoted to real errors. It's harmless until snapshotting
+([Roadmap](/docs/roadmap)) actually starts compacting log prefixes in
+practice, but it's the kind of thing that needs to become a hard error
+before this backs a live cluster.

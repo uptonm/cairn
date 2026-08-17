@@ -17,7 +17,7 @@ different points of completion right now.
 | # | Deliverable | Status | Finished-state demo |
 | --- | --- | --- | --- |
 | 1 | Custom LSM storage engine | **Shipped** | Durable, crash-recoverable local KV store — 32 tests passing |
-| 2 | Raft consensus (single group) | **In design** | Design spec + log-store implementation plan drafted; log store is the next buildable unit |
+| 2 | Raft consensus (single group) | **Core shipped** | Log store + transport + `RaftCore` merged; deterministic simulation proves 4 safety invariants under fault injection — 104 lib + 9 sim tests |
 | 3 | MVCC transactions | Planned | Snapshot-isolation transactions, checker-proven |
 | 4 | Multi-Raft (many groups) | Planned | Many key ranges, per-group consensus |
 | 5 | Shard router + control plane | Planned | Live sharded cluster, visualized, fault-tested |
@@ -32,19 +32,46 @@ a `BTreeMap` reference model and explicit crash-recovery integration tests.
 See [LSM Storage Engine](/docs/lsm-engine) for internals and
 [Benchmarks](/docs/benchmarks) for real numbers.
 
-## Phase 2 — Raft consensus (in design)
+## Phase 2 — Raft consensus (core shipped)
 
-Full single-group Raft in one cycle: leader election with pre-vote, log
-replication, a commit index, linearizable reads via read-index, log
-persistence, snapshotting/log compaction, and joint-consensus membership
-changes. The design spec resolved the open forks — real TCP transport
-behind a `Transport` trait (so a deterministic in-memory transport can drive
-tests), and a **dedicated Raft log store** rather than reusing the LSM
-engine (see [Raft-over-Paxos](/docs/decisions/raft-over-paxos) for why Raft
-was chosen, and the log-store note in
+`crates/raft` (`cairn-raft`) shipped the consensus core across three
+cycles, built strictly bottom-up and each merged in turn:
+
+- **Log store** — durable, index-addressed log entries, CRC'd hard state,
+  and crash-tolerant replay with truncate-on-open. See
+  [Log Store](/docs/consensus/log-store).
+- **Transport** — a `Transport` trait with a deterministic, seeded
+  in-memory implementation (fault injection: partition, drop, delay) and a
+  length-prefixed framed TCP implementation. See
+  [Transport](/docs/consensus/transport).
+- **`RaftCore`** — a pure, synchronous, I/O-free step function: pre-vote
+  leader election, log replication with the consistency check and conflict
+  back-up, commit-index advancement under Raft's current-term rule, and
+  read-index linearizable reads. Proven by a deterministic multi-node
+  simulation against four safety invariants (election safety, log
+  matching, state-machine safety, leader completeness) under partition,
+  drop, reorder, and crash-restart fault injection — **104 library tests
+  plus 9 simulation tests, green.** See
+  [Safety Invariants & Simulation](/docs/consensus/safety-and-simulation).
+
+Building a dedicated log store rather than reusing the LSM engine, and real
+TCP behind a `Transport` trait with a deterministic in-memory substrate for
+tests, were both resolved early — see
+[Raft-over-Paxos](/docs/decisions/raft-over-paxos) for why Raft was chosen,
 [LSM-over-B-tree](/docs/decisions/lsm-over-btree) for why the log isn't
-just another LSM consumer). The first buildable unit — the log store itself
-— has an implementation plan drafted and is the next thing to ship.
+just another LSM consumer, and
+[Pre-vote and read-index](/docs/decisions/pre-vote-and-read-index) for a
+real cross-cutting safety bug the pre-vote design caught before merge.
+
+**Next, in order:** `InstallSnapshot` handling and log compaction, plus
+joint-consensus membership changes (config is currently fixed at
+construction); then a node driver — the async event loop wiring
+`RaftCore` to the real transport, a real clock, and a disk-backed log-store
+adapter, proven with a real-socket TCP integration test; then the
+chaos/Jepsen harness, which drives a live cluster through the same fault
+classes the simulation already covers and checks the resulting history with
+a per-key linearizability checker (`lincheck`, already built alongside
+`RaftCore`) instead of hand-asserted invariants.
 
 ## Phase 3 — MVCC transactions
 
@@ -53,7 +80,9 @@ ordering for a timestamp/version source: `begin()`, `txn.get/put`,
 `txn.commit() → ok | conflict`. Garbage collection of obsolete versions
 folds into the existing compaction path. Cross-shard transactions are
 explicitly deferred past this phase — the initial guarantee set is
-single-group.
+single-group. Blocked on the rest of Phase 2 (node driver + real
+integration), not on `RaftCore` itself — the commit-ordering primitive this
+phase needs is already proven, just not yet wired to a running node.
 
 ## Phase 4 — Multi-Raft
 
@@ -72,8 +101,13 @@ per-group leadership.
 
 Not a phase of its own — it's the thread that runs through Phases 2–4.
 Deterministic, seeded multi-node simulation catches most consensus bugs
-before real sockets are involved; a Jepsen-style chaos harness then injects
-partitions, drops, delays, reorders, crashes, and clock skew against a real
-cluster and checks the resulting history for linearizability and snapshot
-isolation violations. That checker output, committed as evidence, is the
-actual deliverable — proving the guarantees, not asserting them.
+before real sockets are involved, and that simulation is already running
+against `RaftCore` — see
+[Safety Invariants & Simulation](/docs/consensus/safety-and-simulation). A
+Jepsen-style chaos harness will extend the same fault classes (partition,
+drop, delay, reorder, crash) to a real cluster over real sockets and check
+the resulting history for linearizability and snapshot isolation
+violations. The per-key linearizability checker (`lincheck`) that harness
+needs already exists; it isn't wired into a live-cluster harness yet. That
+checker output, committed as evidence, is the actual deliverable — proving
+the guarantees, not asserting them.

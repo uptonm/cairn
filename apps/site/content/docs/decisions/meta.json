@@ -3,6 +3,7 @@
   "pages": [
     "index",
     "raft-over-paxos",
+    "pre-vote-and-read-index",
     "lsm-over-btree",
     "atomic-flush",
     "seqno-recovery"

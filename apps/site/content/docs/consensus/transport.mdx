@@ -1,0 +1,52 @@
+---
+title: Transport
+description: A pluggable Transport trait — a deterministic in-memory implementation for simulation, and a framed TCP implementation for a real cluster.
+---
+
+## Purpose
+
+Raft nodes need to exchange typed RPC messages — `RequestVote`,
+`AppendEntries`, `InstallSnapshot`, and their responses — over the network.
+`crates/raft` puts that behind a single `Transport` trait so the exact same
+message contract can be driven by two very different implementations: a
+real socket for a live cluster, and a deterministic fake for tests. Neither
+`RaftCore` itself nor the message types (`rpc.rs`'s `Message` enum) know or
+care which one is underneath.
+
+## Two implementations, one trait
+
+**The in-memory transport** is a deterministic, seeded message bus built
+for reproducible multi-node testing. It supports fault injection —
+partitioning a node from the rest of the cluster, dropping messages, and
+delaying them — which is exactly the seam the chaos/Jepsen harness
+([Roadmap](/docs/roadmap)) will extend with richer fault scripts. A fixed
+seed is meant to reproduce a run exactly, which is what makes a failing
+test case replayable instead of a one-off flake.
+
+**The TCP transport** is the real one: length-prefixed framed messages over
+a socket, with a small hand-rolled codec rather than a general-purpose RPC
+framework — deliberately dumb, because the pluggable seam exists to serve
+the test harness, not to grow into a feature-rich networking layer.
+
+## Where determinism actually lives
+
+`RaftCore`'s own test suite and the [safety-invariant simulation](/docs/consensus/safety-and-simulation)
+don't drive nodes over the async in-memory transport described above — they
+use a synchronous, single-task message router built specifically for the
+core's tests. That sidesteps a real subtlety: the async in-memory
+transport's seed governs delivery *timing* (partition/drop/delay
+scheduling), but doesn't itself impose an order on messages sent
+concurrently by independent tasks — true determinism there needs either a
+single controlling task or explicit seeded interleaving. `RaftCore`'s
+simulation gets full reproducibility by using a synchronous router driven
+from one task; the async transport in this module is what the eventual node
+driver and the chaos harness exercise, where that real-async, multi-task
+shape is the point.
+
+## What's next
+
+Wiring the transport into an async node event loop — the ticks,
+inbound-message, and client-proposal loop that drives `RaftCore` against a
+real clock — is node-driver work, not yet built. See
+[Overview](/docs/consensus#raftcores-interface) for the core/driver split
+and [Roadmap](/docs/roadmap) for sequencing.

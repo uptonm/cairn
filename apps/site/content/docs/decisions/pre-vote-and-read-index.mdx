@@ -1,0 +1,78 @@
+---
+title: Pre-vote and read-index
+description: Why elections use a non-disruptive pre-vote round and reads use read-index instead of a log write — and a real safety bug the design caught before merge.
+---
+
+## Decision
+
+`RaftCore` runs a **pre-vote** round before any node becomes a real
+candidate, and serves linearizable reads via **read-index** rather than
+routing them through the log. Both are covered in depth in
+[Election and Replication](/docs/consensus/election-and-replication) and
+[Read-Index](/docs/consensus/read-index); this page is about *why*, and
+about a correctness bug the pre-vote design surfaced in the RPC contract
+itself.
+
+## Why pre-vote
+
+A partitioned node that can't reach the current leader keeps timing out and
+incrementing its term, over and over, without ever actually winning an
+election — it can't, because it can't reach a majority. The problem shows
+up the moment it rejoins: its inflated term outranks the legitimate
+leader's, and a plain Raft implementation forces that leader to step down
+for no real reason, disrupting a cluster that was working fine. Pre-vote
+asks peers "would you vote for me" without incrementing the asking node's
+term or persisting anything on the responding side — only a *majority*
+pre-vote grant lets the node proceed to a real, term-incrementing election.
+A partitioned node's pre-votes simply never reach quorum, so it never
+disrupts anything.
+
+## Why read-index over a log-routed read
+
+The alternative — append a no-op command, wait for it to commit, then read
+— is correct but puts every read through a log append and an fsync. For a
+project whose storage engine's whole point is a fast write path
+([LSM over B-tree](/docs/decisions/lsm-over-btree)), taxing every read the
+same way a write is taxed gives up a real advantage for no correctness
+gain. Read-index confirms leadership via a heartbeat quorum round instead —
+no log growth per read — while still proving the read reflects everything
+committed before it began.
+
+## The bug pre-vote's own contract caught
+
+Adding pre-vote isn't free: a `RequestVote` response has to be
+distinguishable as either "yes, I'd hypothetically vote for you" (a
+pre-vote grant) or "yes, you have my vote this term" (a real grant) —
+conflating the two is a latent election-safety violation. The original
+"frozen" RPC contract was `RequestVoteResp { term, vote_granted }`, with no
+field to tell those two cases apart.
+
+The failure mode: if a peer receiving a pre-vote request happens to already
+be sitting at the candidate's prospective term (`T+1`) for unrelated
+reasons, its grant is ambiguous by construction — a candidate counting that
+response toward a *real* vote tally, when the peer only meant to grant a
+*pre-vote*, could let two different nodes each believe they won an election
+in the same term. That's a direct violation of election safety, the first
+of the [four invariants](/docs/consensus/safety-and-simulation#the-four-invariants)
+the whole test suite exists to prove — and term-overloading (trying to
+infer pre-vote-vs-real from term arithmetic alone) turns out not to be
+fixable; the ambiguity is structural, not a matter of picking cleverer
+numbers.
+
+This was caught by a whole-branch adversarial review pass — not by any
+single per-task unit test, since each task's own tests were internally
+consistent with the contract as specified. The fix extends the contract
+deliberately: `RequestVoteResp` gained a `pre_vote: bool` field, echoing the
+request's own `pre_vote` flag back. A candidate now counts a response
+toward its pre-vote tally only when `resp.pre_vote` is set, and toward its
+real-vote tally only when it isn't — the ambiguity is gone by construction
+instead of by convention. The hand-rolled TCP codec
+([Transport](/docs/consensus/transport)) was updated for the new field
+alongside the type change.
+
+The broader lesson kept from this: an RPC contract that looks "frozen"
+because an earlier design phase settled it isn't actually immutable once a
+later phase's behavior depends on distinguishing cases the original
+contract couldn't express — extend it deliberately, with the same
+adversarial scrutiny as any other consensus-critical change, rather than
+working around the gap in caller logic.

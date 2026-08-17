@@ -1,0 +1,82 @@
+---
+title: Election and Replication
+description: Pre-vote leader election and log replication with the consistency check and conflict back-up, as a pure step function.
+---
+
+## Roles and time
+
+`RaftCore` tracks four roles — `Follower`, `PreCandidate`, `Candidate`,
+`Leader` — and advances purely on logical time: `tick()` drives every
+timeout, and there is no `Instant`/`SystemTime` anywhere in the core.
+Election timeouts are randomized per node, drawn from a seeded PRNG held
+inside the core, so the same construction seed reproduces the same election
+timing run after run — a requirement for the
+[deterministic simulation](/docs/consensus/safety-and-simulation) to be
+meaningful at all.
+
+## Pre-vote: elections without disruption
+
+A naive Raft election lets any follower that stops hearing from a leader
+increment its term and start soliciting votes. That's a problem for a node
+that's merely partitioned, not actually needed: it keeps incrementing its
+term on every timeout, and the moment it rejoins the cluster, its inflated
+term forces a legitimate, working leader to step down for no real reason.
+
+`RaftCore` runs a **pre-vote** round first: on election timeout, a follower
+sends `RequestVote { pre_vote: true }` *without* bumping its own term. Peers
+answer honestly — would they vote for this candidate, hypothetically — using
+the same up-to-date-log check a real vote uses, but the responder doesn't
+persist anything or mutate `voted_for` for a pre-vote. Only if a *majority*
+grants the pre-vote does the node become a real `Candidate`: increment its
+term, vote for itself, persist that hard state, and broadcast a real
+`RequestVote`. A partitioned node's pre-votes simply never reach a quorum,
+so it never disrupts a healthy cluster. Any message carrying a higher term
+than the node's own — pre-vote or real — steps it down to `Follower` and
+persists the observed term.
+
+## Vote granting
+
+A peer grants a real vote iff the candidate's log is at least as
+up-to-date as its own (compared by `last_log_term`, then `last_log_index`
+as a tiebreak) **and** it hasn't already voted for a different candidate
+this term. `voted_for` is persisted *before* the grant is sent — reversing
+that order would let a crash between "decide to grant" and "persist the
+vote" produce a double vote across a restart, which is exactly what the
+core's restart test pins down.
+
+## Replication and the consistency check
+
+`AppendEntries` carries `prev_log_index`/`prev_log_term` so a follower can
+check that its log agrees with the leader's immediately before the new
+entries. On a mismatch, the follower rejects and returns a `conflict_index`
+hint rather than making the leader retry one index at a time — that hint is
+what lets a badly lagging follower catch up in a handful of round trips
+instead of one per missing entry. On a match, the follower truncates any
+conflicting suffix (`truncate_suffix` — see [Log Store](/docs/consensus/log-store))
+before appending the new entries. Heartbeats are just empty `AppendEntries`
+calls, reusing the exact same consistency-check path as a real replication
+round.
+
+The leader tracks `next_index`/`match_index` per peer and updates them from
+each ack — advancing on success, backing up using `conflict_index` on
+rejection.
+
+## Commit advancement: the current-term rule
+
+The leader advances its commit index to the highest index that's
+replicated on a majority of `match_index` values — but only counting
+entries **that belong to the current term**. This is Raft §5.4.2's
+guardrail against a classic bug: committing an *older*-term entry purely by
+replica count can be undone by a later leader that legitimately overwrites
+it, which would mean a "committed" entry silently disappears. `RaftCore`'s
+simulation pins this down with a dedicated scenario — a leader appends an
+entry, gets partitioned before it commits, and a new leader is elected and
+overwrites the uncommitted entry — asserting the old entry never gets
+counted as committed by count alone. Followers adopt
+`min(leader_commit, last_index)` as their own commit index once they've
+matched the leader's log up to that point.
+
+See [Read-Index](/docs/consensus/read-index) for how commit advancement
+feeds linearizable reads, and
+[Safety Invariants & Simulation](/docs/consensus/safety-and-simulation) for
+how all of this is checked under fault injection.

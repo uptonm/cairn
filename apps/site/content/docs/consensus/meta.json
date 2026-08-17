@@ -1,0 +1,11 @@
+{
+  "title": "Raft Consensus",
+  "pages": [
+    "index",
+    "log-store",
+    "transport",
+    "election-and-replication",
+    "read-index",
+    "safety-and-simulation"
+  ]
+}
